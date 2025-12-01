@@ -5,11 +5,11 @@ from compressai.entropy_models import EntropyBottleneck, GaussianConditional
 from compressai.ans import BufferedRansEncoder, RansDecoder
 from compressai.models.utils import update_registered_buffers
 
+
 from modules.swin_module import (
     ResScaleConvGateBlock,
     SwinBlockWithConvMulti,
-    MutiScaleDictionaryCrossAttentionGELU,
-    MoEDictionaryCrossAttention
+    SpectralMoEDictionaryCrossAttention 
 )
 from modules.resnet_module import (
     ResidualBottleneckBlockWithStride,
@@ -41,7 +41,6 @@ class DCAE(CompressionModel):
         M=320,
         num_slices=5,
         max_support_slices=5,
-        **kwargs,
     ):
         super().__init__()
         if head_dim is None:
@@ -63,42 +62,24 @@ class DCAE(CompressionModel):
         swin_block = SwinBlockWithConvMulti
         block_counts = [1, 2, 12]
 
-        # dict_num = 128
-        # dict_head_num = 20
-        # dict_dim = 32 * dict_head_num
-        # self.dt = nn.Parameter(torch.randn([dict_num, dict_dim]), requires_grad=True)
-
-        dict_head_num = 20
-        num_experts = 4       # K=4 experts
-        expert_entries = 64   # N=64 entries per expert (Total capacity = 256)
-        
+        # Config for Spectral MoE
+        dict_head_num = 10
         prior_dim = M
         mlp_rate = 4
 
-
-        # Cross Attention
-        # self.dt_cross_attention = nn.ModuleList(
-        #     [
-        #         MutiScaleDictionaryCrossAttentionGELU(
-        #             input_dim=M * 2 + (M // self.num_slices) * i,
-        #             output_dim=M,
-        #             head_num=dict_head_num,
-        #             mlp_rate=mlp_rate,
-        #             qkv_bias=True,
-        #         )
-        #         for i in range(num_slices)
-        #     ]
-        # )
+        # New Params for MoE
+        num_experts = 4
+        expert_entries = 32 
         self.dt_cross_attention = nn.ModuleList(
             [
-                MoEDictionaryCrossAttention(
+                SpectralMoEDictionaryCrossAttention(
                     input_dim=M * 2 + (M // self.num_slices) * i,
                     output_dim=M,
                     head_num=dict_head_num,
                     mlp_rate=mlp_rate,
                     qkv_bias=True,
-                    num_experts=num_experts,    # New Param
-                    expert_entries=expert_entries # New Param
+                    num_experts=num_experts,       # MoE Param
+                    expert_entries=expert_entries  # MoE Param
                 )
                 for i in range(num_slices)
             ]
@@ -291,9 +272,6 @@ class DCAE(CompressionModel):
         return updated
 
     def forward(self, x):
-        # b = x.size(0)
-        # dt = self.dt.unsqueeze(0).expand(b, -1, -1)
-
         y = self.g_a(x)
         y_shape = y.shape[2:]
 
@@ -321,7 +299,6 @@ class DCAE(CompressionModel):
             )
             query = torch.cat([latent_scales, latent_means] + support_slices, dim=1)
 
-            # dict_info = self.dt_cross_attention[slice_index](query, dt)
             dict_info = self.dt_cross_attention[slice_index](query)
 
             support = torch.cat([query, dict_info], dim=1)
@@ -356,6 +333,7 @@ class DCAE(CompressionModel):
             "x_hat": x_hat,
             "likelihoods": {"y": y_likelihoods, "z": z_likelihoods},
             "para": {"means": means, "scales": scales, "y": y},
+            "dict_info": dict_info
         }
 
     def load_state_dict(self, state_dict, strict=True):
@@ -378,15 +356,11 @@ class DCAE(CompressionModel):
             # Fallback or specific logic if keys differ
             N = 192
             M = 320
-
         net = cls(N=N, M=M)
         net.load_state_dict(state_dict)
         return net
 
     def compress(self, x):
-        # b = x.size(0)
-        # dt = self.dt.unsqueeze(0).expand(b, -1, -1)
-
         y = self.g_a(x)
         y_shape = y.shape[2:]
 
@@ -416,7 +390,7 @@ class DCAE(CompressionModel):
                 else y_hat_slices[: self.max_support_slices]
             )
             query = torch.cat([latent_scales, latent_means] + support_slices, dim=1)
-            # dict_info = self.dt_cross_attention[slice_index](query, dt)
+            
             dict_info = self.dt_cross_attention[slice_index](query)
 
             support = torch.cat([query, dict_info], dim=1)
@@ -455,10 +429,7 @@ class DCAE(CompressionModel):
         latent_scales = self.h_z_s1(z_hat)
         latent_means = self.h_z_s2(z_hat)
 
-        # b = z_hat.size(0)
-        # dt = self.dt.unsqueeze(0).expand(b, -1, -1)
         y_shape = [z_hat.shape[2] * 4, z_hat.shape[3] * 4]
-
         y_string = strings[0][0]
 
         y_hat_slices = []
@@ -476,7 +447,8 @@ class DCAE(CompressionModel):
                 else y_hat_slices[: self.max_support_slices]
             )
             query = torch.cat([latent_scales, latent_means] + support_slices, dim=1)
-            # dict_info = self.dt_cross_attention[slice_index](query, dt)
+            
+            # Updated forward call
             dict_info = self.dt_cross_attention[slice_index](query)
 
             support = torch.cat([query, dict_info], dim=1)
