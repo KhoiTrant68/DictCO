@@ -13,5 +13,5 @@ services:
       - ./:/workspace
     command: >
       bash -c "
-      uv run train.py -d dataset -save_path new_output -e 10 -n 2
+      uv run train.py -d dataset -save_path new_output -e 10000 -n 4
       "
