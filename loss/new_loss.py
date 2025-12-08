@@ -84,11 +84,11 @@ class FocalFrequencyLoss(nn.Module):
         return (diff * weight).mean()
 
 class RateDistortionLoss(nn.Module):
-    def __init__(self, lmbda=1e-2, metrics="mse", 
+    def __init__(self, lmbda=1e-2, loss_type="mse", 
                  alpha_spectral=0.1, alpha_moe=1.0, alpha_lpips=0.5):
         super().__init__()
         self.lmbda = lmbda
-        self.metrics = metrics
+        self.loss_type = loss_type
         
         # Weights for Aux losses
         self.alpha_spectral = alpha_spectral
@@ -120,21 +120,21 @@ class RateDistortionLoss(nn.Module):
         # --- 2. Main Distortion ---
         x_hat = output["x_hat"]
         
-        if self.metrics == "mse":
+        if self.loss_type == "mse":
             out["mse_loss"] = self.mse(x_hat, target)
             dist_loss = 255**2 * out["mse_loss"]
             
-        elif self.metrics == "charbonnier":
+        elif self.loss_type == "charbonnier":
             out["char_loss"] = self.charbonnier(x_hat, target)
             dist_loss = 255**2 * out["char_loss"]
             
-        elif self.metrics == "ms_ssim":
+        elif self.loss_type == "ms_ssim":
             if ms_ssim is None:
                 raise ImportError("pytorch_msssim not installed")
             out["ms_ssim_loss"] = 1 - ms_ssim(x_hat, target, data_range=1.0)
             dist_loss = 255**2 * out["ms_ssim_loss"] # Scale to match MSE magnitude
         else:
-            raise ValueError(f"Unknown metric: {self.metrics}")
+            raise ValueError(f"Unknown metric: {self.loss_type}")
 
         out["dist_loss"] = dist_loss
 
