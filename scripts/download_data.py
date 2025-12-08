@@ -33,7 +33,7 @@ for split, amount in map_amount.items():
 
     fo_split_dir = os.path.join(data["path"], name, split, "data")
 
-    final_split = "val" if split == "validation" else split
+    final_split = "valid" if split == "validation" else split
     out_dir = os.path.join(OUTPUT_ROOT, final_split)
     os.makedirs(out_dir, exist_ok=True)
 
