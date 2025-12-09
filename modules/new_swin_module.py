@@ -266,19 +266,22 @@ class LearnableWaveletTransform(nn.Module):
     def _lifting_step(self, x, P, U, dim):
         if dim == 2: # Height
             even = x[:, :, 0::2, :]
-            odd  = x[:, :, 1::2, :]
-        else:        # Width
+            odd = x[:, :, 1::2, :]
+        else: # Width
             even = x[:, :, :, 0::2]
-            odd  = x[:, :, :, 1::2]
+            odd = x[:, :, :, 1::2]
 
         high = odd - P(even)
         low = even + U(high)
         return low, high
 
     def forward(self, x):
+        # 1. Horizontal (dim=3)
         l_horz, h_horz = self._lifting_step(x, self.P_horz, self.U_horz, dim=3)
+        # 2. Vertical (dim=2) applied to both horz results
         ll, lh = self._lifting_step(l_horz, self.P_vert, self.U_vert, dim=2)
         hl, hh = self._lifting_step(h_horz, self.P_vert, self.U_vert, dim=2)
+        
         hf = torch.cat([lh, hl, hh], dim=1)
         return ll, hf
 
@@ -294,26 +297,33 @@ class InverseLearnableWaveletTransform(nn.Module):
         even = low - U(high)
         odd = high + P(even)
         
-        if dim == 2: # Height
+        # OPTIMIZED: Use torch.stack -> view instead of allocating zeros
+        # This avoids initializing a large zero tensor and then filling it
+        if dim == 2: # Height reconstruction
+            # even: [B, C, H, W] -> Stack dim 3 -> [B, C, H, 2, W] -> View -> [B, C, H*2, W]
             B, C, H, W = even.shape
-            out = torch.zeros(B, C, H*2, W, device=low.device)
-            out[:, :, 0::2, :] = even
-            out[:, :, 1::2, :] = odd
-        else: # Width
+            combined = torch.stack((even, odd), dim=3)
+            return combined.view(B, C, H * 2, W)
+            
+        else: # Width reconstruction
+            # even: [B, C, H, W] -> Stack dim 4 -> [B, C, H, W, 2] -> View -> [B, C, H, W*2]
             B, C, H, W = even.shape
-            out = torch.zeros(B, C, H, W*2, device=low.device)
-            out[:, :, :, 0::2] = even
-            out[:, :, :, 1::2] = odd
-        return out
+            combined = torch.stack((even, odd), dim=4)
+            return combined.view(B, C, H, W * 2)
 
     def forward(self, ll, hf):
         C = ll.shape[1]
         lh, hl, hh = torch.split(hf, C, dim=1)
+        
+        # 1. Inverse Vertical
         l_horz = self._inverse_lifting_step(ll, lh, self.P_vert, self.U_vert, dim=2)
         h_horz = self._inverse_lifting_step(hl, hh, self.P_vert, self.U_vert, dim=2)
+        
+        # 2. Inverse Horizontal
         x = self._inverse_lifting_step(l_horz, h_horz, self.P_horz, self.U_horz, dim=3)
+        
         return x
-
+    
 class InterBandRouter(nn.Module):
     def __init__(self, dim_high, dim_low, num_experts):
         super().__init__()
@@ -343,6 +353,7 @@ class SpectralMoEDictionaryCrossAttention(nn.Module):
         self.dim_low = 32 * head_num
         self.dim_high = 32 * head_num * 3 
         
+        # Optimized Wavelet classes (defined below)
         self.dwt = LearnableWaveletTransform(32 * head_num)
         self.idwt = InverseLearnableWaveletTransform(32 * head_num)
         
@@ -367,7 +378,7 @@ class SpectralMoEDictionaryCrossAttention(nn.Module):
         self.k_high = nn.Linear(self.dim_high, self.dim_high, bias=qkv_bias)
         self.v_all = nn.Linear(self.dim_high, self.dim_high, bias=qkv_bias)
 
-        # Utils - Initialize MSA and MLP with HIDDEN dim (c_block)
+        # Utils
         self.msa = MultiScaleAggregation(c_block) 
         self.ln_scale = nn.LayerNorm(c_block)
         self.res_scale_1 = Scale(c_block, init_value=1.0)
@@ -375,12 +386,14 @@ class SpectralMoEDictionaryCrossAttention(nn.Module):
         self.mlp = ConvGELU(c_block, c_block * mlp_rate) 
         self.res_scale_2 = Scale(c_block, init_value=1.0)
         
-        # Loss-Free Balancing State (Algo 1)
-        # Register as buffer so it's saved in state_dict but not optimized by SGD
+        # Loss-Free Balancing State
         self.register_buffer("expert_biases", torch.zeros(num_experts))
         
+        # Caching for Loss/Balancer
         self.last_routing_weights = None
         self.last_routing_logits = None
+        self.last_routing_indices = None # <--- NEW: Cache indices
+        
         self._init_weights()
 
     def _init_weights(self):
@@ -388,6 +401,7 @@ class SpectralMoEDictionaryCrossAttention(nn.Module):
         trunc_normal_(self.experts_high, std=0.02)
 
     def process_low_freq(self, x):
+        # x is NCHW
         x_perm = x.permute(0, 2, 3, 1) 
         x_norm = self.ln_low(x_perm)
         q = self.q_low(x_norm)
@@ -395,36 +409,37 @@ class SpectralMoEDictionaryCrossAttention(nn.Module):
         attn = torch.matmul(q, k.transpose(0, 1)) * self.scale
         attn = F.softmax(attn, dim=-1)
         out = torch.matmul(attn, self.dict_low)
-        return out.permute(0, 3, 1, 2)
+        return out.permute(0, 3, 1, 2) # Return NCHW
 
     def process_high_freq_guided(self, hf, lf):
+        # hf, lf are NHWC here
         B, H, W, C_high = hf.shape
         
         # 1. Routing Logits
         routing_logits = self.router(hf, lf) 
-        
-        # Save RAW logits for external training loop/loss monitoring
-        # (Though loss-free algo updates biases manually, monitoring is still useful)
         self.last_routing_logits = routing_logits 
         
-        # 2. Apply Loss-Free Balancing Bias (Equation 3 in PDF)
-        # "expert bias term is only used to adjust the routing strategy (top-k selection)"
-        # Note: We apply bias to logits before Top-K, but typically softmax for gating weights 
-        # is calculated on the *original* or *biased* logits depending on specific MoE implementation.
-        # The paper says: "use the biased scores to determine the top-K selection".
+        # 2. Apply Loss-Free Balancing Bias
         biased_logits = routing_logits + self.expert_biases.view(1, 1, 1, -1)
         
-        # Get Routing Weights (Probabilities)
-        # Paper implies bias affects selection. Standard MoE usually softmaxes the selected logits.
-        # Here we follow standard practice: Softmax on biased logits to influence gradients 
-        # (if we were using aux loss) or just selection.
+        # --- OPTIMIZATION: Calculate Top-K Once ---
+        # We calculate indices here and save them. 
+        # The external Loss/Balancer will read self.last_routing_indices
+        with torch.no_grad():
+             _, topk_indices = torch.topk(biased_logits, k=2, dim=-1)
+             self.last_routing_indices = topk_indices
+        # ------------------------------------------
+
+        # Softmax on biased logits
         routing_weights = F.softmax(biased_logits, dim=-1)
-        self.last_routing_weights = routing_weights # Save for tracking usage
+        self.last_routing_weights = routing_weights 
         
         # 3. Expert Attention
         all_keys = self.k_high(self.ln_dict_high(self.experts_high))
         q = self.q_high(self.ln_high(hf))
         q_flat = q.view(B, -1, C_high)
+        
+        # Efficient Matmul
         sim = torch.matmul(q_flat, all_keys.transpose(0, 1)) * (C_high ** -0.5)
         sim = sim.view(B, H*W, self.num_experts, -1)
         attn = F.softmax(sim, dim=-1)
@@ -441,45 +456,51 @@ class SpectralMoEDictionaryCrossAttention(nn.Module):
         return final_out.view(B, H, W, C_high)
 
     def forward(self, x):
+        # x is NCHW
         shortcut = x
+        
+        # Prepare for Wavelet (NHWC -> Linear -> NCHW)
         x_emb = self.x_trans(x.permute(0, 2, 3, 1).contiguous()).permute(0, 3, 1, 2).contiguous()
+        
+        # DWT (Returns NCHW)
         ll, hf = self.dwt(x_emb)
         
+        # Process Low Freq (NCHW -> NCHW)
         ll_processed = self.process_low_freq(ll)
         
+        # Process High Freq (Needs NHWC inputs)
         ll_perm = ll_processed.permute(0, 2, 3, 1)
         hf_perm = hf.permute(0, 2, 3, 1)
         
+        # Returns NHWC, then we permute back to NCHW for IDWT
         hf_processed = self.process_high_freq_guided(hf_perm, ll_perm)
         hf_processed = hf_processed.permute(0, 3, 1, 2)
         
-        recon = self.idwt(ll_processed, hf_processed) # Output is NCHW
+        # IDWT (Returns NCHW)
+        recon = self.idwt(ll_processed, hf_processed) 
         
-        #Apply MSA and MLP properly by respecting channel-last/channel-first conventions
+        # --- OPTIMIZATION: Minimize Permutations ---
+        # Instead of flipping back and forth for MSA and MLP, 
+        # flip to NHWC once, do all ops, then flip back.
         
-        # 1. MSA (MultiScaleAggregation) expects NHWC input
-        recon_nhwc = recon.permute(0, 2, 3, 1) 
-        msa_in = self.ln_scale(recon_nhwc)
-        # self.msa returns NHWC
+        # 1. Convert to NHWC once
+        recon = recon.permute(0, 2, 3, 1) 
+        
+        # 2. MSA Block (Native NHWC)
+        msa_in = self.ln_scale(recon)
         msa_out = self.msa(msa_in) 
-        # self.res_scale_1 expects NHWC
-        scaled_msa = self.res_scale_1(msa_out)
-        # Add residual to recon (NCHW) by permuting scaled_msa back to NCHW
-        recon = recon + scaled_msa.permute(0, 3, 1, 2)
+        recon = recon + self.res_scale_1(msa_out) # Add in NHWC
         
-        # 2. MLP (ConvGELU) expects NHWC input
-        recon_nhwc = recon.permute(0, 2, 3, 1)
-        mlp_in = self.ln_mlp(recon_nhwc)
-        # self.mlp returns NHWC
+        # 3. MLP Block (Native NHWC)
+        mlp_in = self.ln_mlp(recon)
         mlp_out = self.mlp(mlp_in)
-        # self.res_scale_2 expects NHWC
-        scaled_mlp = self.res_scale_2(mlp_out)
-        # Add residual to recon (NCHW)
-        recon = recon + scaled_mlp.permute(0, 3, 1, 2)
+        recon = recon + self.res_scale_2(mlp_out) # Add in NHWC
         
-        # Output Projection
-        # output_trans expects NHWC
-        out = self.output_trans(recon.permute(0, 2, 3, 1).contiguous()).permute(0, 3, 1, 2).contiguous()
+        # 4. Output Projection (Linear expects NHWC usually)
+        out = self.output_trans(recon)
+        
+        # 5. Final Permute back to NCHW
+        out = out.permute(0, 3, 1, 2).contiguous()
         
         if self.input_dim == self.output_dim:
              out = out + shortcut

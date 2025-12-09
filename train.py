@@ -30,74 +30,69 @@ torch.backends.cudnn.benchmark = True
 
 # =========================================================
 #  LOSS-FREE BALANCER (Algorithm 1 from Paper)
+#  OPTIMIZED FOR DDP & PRE-CALCULATED INDICES
 # =========================================================
 class LossFreeBalancer:
     """
     Manages the expert biases for Loss-Free Balancing.
     Updates biases based on the sign of the load violation error.
+    Optimized to handle DDP synchronization and pre-calculated Top-K indices.
     """
     def __init__(self, num_experts, update_rate=0.001):
         self.num_experts = num_experts
         self.update_rate = update_rate
         # We don't store biases here permanently; we read/write to the model's buffers
 
-    def update_model_biases(self, model, router_logits_tuple):
+    @torch.no_grad()
+    def update_model_biases(self, model, router_data_tuple, accelerator=None):
         """
         Args:
             model: The unwrapped DCAE model.
-            router_logits_tuple: Tuple of logits [Batch*H*W, NumExperts] from forward pass.
+            router_data_tuple: List of tuples (logits, topk_indices) OR just logits from forward pass.
+            accelerator: HuggingFace Accelerator instance (Required for DDP correctness).
         """
-        # Iterate over each MoE layer (slice)
-        # We assume the order of logits matches the order of dt_cross_attention layers
-        if router_logits_tuple is None:
+        if router_data_tuple is None:
             return
 
-        for i, logits in enumerate(router_logits_tuple):
-            # logits shape: [N_tokens, NumExperts]
-            
-            # 1. Calculate Load (ci)
-            # Top-1 selection for load counting usually sufficient, 
-            # though paper implies monitoring the routing decision.
-            # Using Top-k selection count is more accurate for k>1 models.
-            # Here we approximate with Top-1 for standard load balancing logic
-            # or sum probabilities if soft. Paper uses "number of assigned tokens".
-            
-            # Hard assignment count (Top-K)
-            k = 2 # Assuming k=2 based on your model config
-            _, topk_indices = torch.topk(logits, k, dim=-1)
-            
-            # Flatten indices to count globally
+        for i, layer_data in enumerate(router_data_tuple):
+            # Check if we have pre-calculated indices (Tuple) or just logits (Tensor)
+            # The optimized Swin module returns (logits, indices)
+            if isinstance(layer_data, (tuple, list)) and len(layer_data) == 2:
+                logits, topk_indices = layer_data
+            else:
+                logits = layer_data
+                # Fallback: Calculate Top-K if not provided (k=2 assumption based on config)
+                _, topk_indices = torch.topk(logits, k=2, dim=-1)
+
+            # 1. Flatten indices to count globally
             flat_indices = topk_indices.view(-1)
-            expert_counts = torch.bincount(flat_indices, minlength=self.num_experts).float()
             
-            # 2. Calculate Average Load (c_bar)
+            # 2. Local Counts (on this GPU)
+            local_counts = torch.bincount(flat_indices, minlength=self.num_experts).float()
+            
+            # 3. Global Synchronization (CRITICAL FOR DDP)
+            if accelerator is not None and accelerator.num_processes > 1:
+                # Sum counts across all GPUs so every GPU sees the global load
+                expert_counts = accelerator.reduce(local_counts, reduction="sum")
+            else:
+                expert_counts = local_counts
+
+            # 4. Calculate Load Error
             avg_count = expert_counts.mean()
-            
-            # 3. Calculate Error (e_i = c_i - c_bar)
             violation_error = expert_counts - avg_count
-            
-            # 4. Update Bias: b_i = b_i - u * sign(e_i)
-            # Note: Paper says b_i = b_i + u * sign(e_i) BUT checks logic:
-            # "decreasing it when... heavy load". 
-            # If expert has heavy load, e_i is positive. To decrease selection, we must LOWER score.
-            # So we SUBTRACT the update.
+
+            # 5. Update Bias
+            # Logic: If violation > 0 (Overloaded), we subtract score.
+            # So we subtract the sign of the error.
             update_step = self.update_rate * torch.sign(violation_error)
-            
-            # Access the buffer in the model module
-            # model.dt_cross_attention is a ModuleList
-            if i < len(model.dt_cross_attention):
+
+            # Apply to model buffer
+            # Check if model has the specific MoE layer structure
+            if hasattr(model, 'dt_cross_attention') and i < len(model.dt_cross_attention):
                 moe_module = model.dt_cross_attention[i]
-                
-                # Ensure bias buffer exists (registered in __init__)
                 if hasattr(moe_module, "expert_biases"):
-                    current_bias = moe_module.expert_biases
-                    
-                    # Update (In-place to keep device)
-                    # We subtract because we add bias to logits. Lower bias = lower prob = less load.
-                    new_bias = current_bias - update_step.to(current_bias.device)
-                    
-                    # Apply update
-                    moe_module.expert_biases.copy_(new_bias)
+                    # In-place update on correct device
+                    moe_module.expert_biases.sub_(update_step.to(moe_module.expert_biases.device))
 
 # =========================================================
 #  STANDARD TRAINING UTILS
@@ -185,11 +180,16 @@ def train_one_epoch(
 
         # --- LOSS-FREE BALANCING UPDATE ---
         # Update expert biases based on current batch logits
-        # We perform this Update AFTER optimizer step (or before, doesn't matter much as it's decoupled)
+        # We perform this Update AFTER optimizer step (decoupled update)
         if "router_logits" in out_net and out_net["router_logits"] is not None:
             # We must access the underlying model to modify buffers
             unwrapped = accelerator.unwrap_model(model)
-            balancer.update_model_biases(unwrapped, out_net["router_logits"])
+            # Pass accelerator to allow global synchronization of expert counts
+            balancer.update_model_biases(
+                unwrapped, 
+                out_net["router_logits"], 
+                accelerator=accelerator
+            )
 
         # Aux Backward (Entropy Model)
         unwrapped_model = accelerator.unwrap_model(model)
