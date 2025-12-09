@@ -20,7 +20,7 @@ from accelerate import Accelerator
 from accelerate.utils import set_seed
 
 from compressai.datasets import ImageFolder
-from loss.loss import AverageMeter, RateDistortionLoss 
+from loss.new_loss import AverageMeter, RateDistortionLoss 
 from models.dcae import DCAE
 
 # --- Global Settings ---

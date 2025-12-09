@@ -13,7 +13,7 @@ from PIL import Image
 from pytorch_msssim import ms_ssim
 
 # Assuming DCAE is in a local file 'models.py'
-from models import DCAE
+from models.dcae import DCAE
 
 warnings.filterwarnings("ignore")
 

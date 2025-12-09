@@ -371,10 +371,15 @@ class SpectralMoEDictionaryCrossAttention(nn.Module):
         self.ln_scale = nn.LayerNorm(c_block)
         self.res_scale_1 = Scale(c_block, init_value=1.0)
         self.ln_mlp = nn.LayerNorm(c_block)
-        self.mlp = ConvGELU(c_block, c_block * 4) 
+        self.mlp = ConvGELU(c_block, c_block * mlp_rate) 
         self.res_scale_2 = Scale(c_block, init_value=1.0)
         
+        # Loss-Free Balancing State (Algo 1)
+        # Register as buffer so it's saved in state_dict but not optimized by SGD
+        self.register_buffer("expert_biases", torch.zeros(num_experts))
+        
         self.last_routing_weights = None
+        self.last_routing_logits = None
         self._init_weights()
 
     def _init_weights(self):
@@ -394,13 +399,28 @@ class SpectralMoEDictionaryCrossAttention(nn.Module):
     def process_high_freq_guided(self, hf, lf):
         B, H, W, C_high = hf.shape
         
-        # 1. Routing
+        # 1. Routing Logits
         routing_logits = self.router(hf, lf) 
-        routing_weights = F.softmax(routing_logits, dim=-1)
         
-        self.last_routing_weights = routing_weights
+        # Save RAW logits for external training loop/loss monitoring
+        # (Though loss-free algo updates biases manually, monitoring is still useful)
+        self.last_routing_logits = routing_logits 
         
-        # 2. Expert Attention
+        # 2. Apply Loss-Free Balancing Bias (Equation 3 in PDF)
+        # "expert bias term is only used to adjust the routing strategy (top-k selection)"
+        # Note: We apply bias to logits before Top-K, but typically softmax for gating weights 
+        # is calculated on the *original* or *biased* logits depending on specific MoE implementation.
+        # The paper says: "use the biased scores to determine the top-K selection".
+        biased_logits = routing_logits + self.expert_biases.view(1, 1, 1, -1)
+        
+        # Get Routing Weights (Probabilities)
+        # Paper implies bias affects selection. Standard MoE usually softmaxes the selected logits.
+        # Here we follow standard practice: Softmax on biased logits to influence gradients 
+        # (if we were using aux loss) or just selection.
+        routing_weights = F.softmax(biased_logits, dim=-1)
+        self.last_routing_weights = routing_weights # Save for tracking usage
+        
+        # 3. Expert Attention
         all_keys = self.k_high(self.ln_dict_high(self.experts_high))
         q = self.q_high(self.ln_high(hf))
         q_flat = q.view(B, -1, C_high)
@@ -413,7 +433,7 @@ class SpectralMoEDictionaryCrossAttention(nn.Module):
         
         expert_outputs = torch.einsum("bhke,kec->bhkc", attn, v_experts)
         
-        # 3. Router Weighting
+        # 4. Router Weighting
         router_weights_flat = routing_weights.view(B, H*W, self.num_experts, 1)
         final_out = (expert_outputs * router_weights_flat).sum(dim=2)
         
@@ -434,7 +454,7 @@ class SpectralMoEDictionaryCrossAttention(nn.Module):
         
         recon = self.idwt(ll_processed, hf_processed) # Output is NCHW
         
-        # FIX 2: Apply MSA and MLP properly by respecting channel-last/channel-first conventions
+        #Apply MSA and MLP properly by respecting channel-last/channel-first conventions
         
         # 1. MSA (MultiScaleAggregation) expects NHWC input
         recon_nhwc = recon.permute(0, 2, 3, 1) 
