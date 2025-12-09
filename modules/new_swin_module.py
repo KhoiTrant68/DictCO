@@ -62,7 +62,8 @@ class WMSA(nn.Module):
         x = rearrange(x, "b w1 w2 p1 p2 c -> b (w1 w2) (p1 p2) c", p1=self.window_size, p2=self.window_size).contiguous()
 
         qkv = self.embedding_layer(x)
-        q, k, v = rearrange(qkv, "b nw np (threeh c) -> threeh b nw np c", c=self.head_dim).chunk(3, dim=0).contiguous()
+        q, k, v = rearrange(qkv, "b nw np (threeh c) -> threeh b nw np c", c=self.head_dim).chunk(3, dim=0)
+        q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
 
         sim = torch.einsum("hbwpc,hbwqc->hbwpq", q, k) * self.scale
         relative_position_bias = self.relative_position_params[
@@ -438,7 +439,7 @@ class SpectralMoEDictionaryCrossAttention(nn.Module):
         all_keys = self.k_high(self.ln_dict_high(self.experts_high))
         q = self.q_high(self.ln_high(hf))
         q_flat = q.view(B, -1, C_high)
-        
+
         # Efficient Matmul
         sim = torch.matmul(q_flat, all_keys.transpose(0, 1)) * (C_high ** -0.5)
         sim = sim.view(B, H*W, self.num_experts, -1)
