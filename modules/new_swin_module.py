@@ -160,6 +160,7 @@ class ConvGELU(nn.Module):
     def forward(self, x):
         # Expects NHWC input
         x, v = self.fc1(x).chunk(2, dim=-1)
+        x, v = x.contiguous(), v.contiguous()
         x = self.dwconv(x)
         x = self.act(x) * v
         x = self.fc2(x)
@@ -441,7 +442,7 @@ class SpectralMoEDictionaryCrossAttention(nn.Module):
 
     def forward(self, x):
         shortcut = x
-        x_emb = self.x_trans(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+        x_emb = self.x_trans(x.permute(0, 2, 3, 1).contiguous()).permute(0, 3, 1, 2).contiguous()
         ll, hf = self.dwt(x_emb)
         
         ll_processed = self.process_low_freq(ll)
@@ -478,7 +479,7 @@ class SpectralMoEDictionaryCrossAttention(nn.Module):
         
         # Output Projection
         # output_trans expects NHWC
-        out = self.output_trans(recon.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+        out = self.output_trans(recon.permute(0, 2, 3, 1).contiguous()).permute(0, 3, 1, 2).contiguous()
         
         if self.input_dim == self.output_dim:
              out = out + shortcut
