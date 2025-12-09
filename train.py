@@ -10,6 +10,7 @@ import shutil
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torchvision import transforms
 from torchvision.utils import make_grid
@@ -20,12 +21,87 @@ from accelerate import Accelerator
 from accelerate.utils import set_seed
 
 from compressai.datasets import ImageFolder
-from loss.new_loss import AverageMeter, RateDistortionLoss 
+from loss.loss import AverageMeter, RateDistortionLoss 
 from models.dcae import DCAE
 
 # --- Global Settings ---
 os.environ["TMPDIR"] = "/tmp"
 torch.backends.cudnn.benchmark = True
+
+# =========================================================
+#  LOSS-FREE BALANCER (Algorithm 1 from Paper)
+# =========================================================
+class LossFreeBalancer:
+    """
+    Manages the expert biases for Loss-Free Balancing.
+    Updates biases based on the sign of the load violation error.
+    """
+    def __init__(self, num_experts, update_rate=0.001):
+        self.num_experts = num_experts
+        self.update_rate = update_rate
+        # We don't store biases here permanently; we read/write to the model's buffers
+
+    def update_model_biases(self, model, router_logits_tuple):
+        """
+        Args:
+            model: The unwrapped DCAE model.
+            router_logits_tuple: Tuple of logits [Batch*H*W, NumExperts] from forward pass.
+        """
+        # Iterate over each MoE layer (slice)
+        # We assume the order of logits matches the order of dt_cross_attention layers
+        if router_logits_tuple is None:
+            return
+
+        for i, logits in enumerate(router_logits_tuple):
+            # logits shape: [N_tokens, NumExperts]
+            
+            # 1. Calculate Load (ci)
+            # Top-1 selection for load counting usually sufficient, 
+            # though paper implies monitoring the routing decision.
+            # Using Top-k selection count is more accurate for k>1 models.
+            # Here we approximate with Top-1 for standard load balancing logic
+            # or sum probabilities if soft. Paper uses "number of assigned tokens".
+            
+            # Hard assignment count (Top-K)
+            k = 2 # Assuming k=2 based on your model config
+            _, topk_indices = torch.topk(logits, k, dim=-1)
+            
+            # Flatten indices to count globally
+            flat_indices = topk_indices.view(-1)
+            expert_counts = torch.bincount(flat_indices, minlength=self.num_experts).float()
+            
+            # 2. Calculate Average Load (c_bar)
+            avg_count = expert_counts.mean()
+            
+            # 3. Calculate Error (e_i = c_i - c_bar)
+            violation_error = expert_counts - avg_count
+            
+            # 4. Update Bias: b_i = b_i - u * sign(e_i)
+            # Note: Paper says b_i = b_i + u * sign(e_i) BUT checks logic:
+            # "decreasing it when... heavy load". 
+            # If expert has heavy load, e_i is positive. To decrease selection, we must LOWER score.
+            # So we SUBTRACT the update.
+            update_step = self.update_rate * torch.sign(violation_error)
+            
+            # Access the buffer in the model module
+            # model.dt_cross_attention is a ModuleList
+            if i < len(model.dt_cross_attention):
+                moe_module = model.dt_cross_attention[i]
+                
+                # Ensure bias buffer exists (registered in __init__)
+                if hasattr(moe_module, "expert_biases"):
+                    current_bias = moe_module.expert_biases
+                    
+                    # Update (In-place to keep device)
+                    # We subtract because we add bias to logits. Lower bias = lower prob = less load.
+                    new_bias = current_bias - update_step.to(current_bias.device)
+                    
+                    # Apply update
+                    moe_module.expert_biases.copy_(new_bias)
+
+# =========================================================
+#  STANDARD TRAINING UTILS
+# =========================================================
 
 def setup_logger(log_dir):
     logger = logging.getLogger("TrainLogger")
@@ -45,7 +121,6 @@ def setup_logger(log_dir):
     return logger
 
 def configure_optimizers(net, args):
-    """Separate parameters for the main optimizer and the auxiliary optimizer."""
     parameters = {
         n
         for n, p in net.named_parameters()
@@ -70,16 +145,18 @@ def configure_optimizers(net, args):
     return optimizer, aux_optimizer
 
 def train_one_epoch(
-    model, criterion, train_dataloader, optimizer, aux_optimizer, epoch, clip_max_norm, accelerator, logger, writer, global_step
+    model, criterion, train_dataloader, optimizer, aux_optimizer, 
+    epoch, clip_max_norm, accelerator, logger, writer, global_step,
+    balancer # <--- NEW Argument
 ):
     model.train()
     
     losses = AverageMeter()
     bpp_losses = AverageMeter()
     dist_losses = AverageMeter()
-    aux_losses = AverageMeter()
+    aux_losses = AverageMeter() # Quantile loss
+    moe_metrics = AverageMeter() # Just for logging
     
-    # Identify distortion key
     if criterion.loss_type == "mse":
         dist_key = "mse_loss"
     elif criterion.loss_type == "charbonnier":
@@ -88,13 +165,14 @@ def train_one_epoch(
         dist_key = "ms_ssim_loss"
 
     for i, d in enumerate(train_dataloader):
-        # Accelerate handles device placement automatically!
-        
         optimizer.zero_grad(set_to_none=True)
         aux_optimizer.zero_grad(set_to_none=True)
 
         # Forward Pass
         out_net = model(d)
+        
+        # Compute Loss
+        # Note: use_loss_free_balancing=True in criterion means 'moe_loss' is NOT added to 'loss'
         out_criterion = criterion(out_net, d)
         
         # Backward (Main)
@@ -105,8 +183,15 @@ def train_one_epoch(
 
         optimizer.step()
 
-        # Aux Backward
-        # Need to unwrap model to access .aux_loss() in DDP
+        # --- LOSS-FREE BALANCING UPDATE ---
+        # Update expert biases based on current batch logits
+        # We perform this Update AFTER optimizer step (or before, doesn't matter much as it's decoupled)
+        if "router_logits" in out_net and out_net["router_logits"] is not None:
+            # We must access the underlying model to modify buffers
+            unwrapped = accelerator.unwrap_model(model)
+            balancer.update_model_biases(unwrapped, out_net["router_logits"])
+
+        # Aux Backward (Entropy Model)
         unwrapped_model = accelerator.unwrap_model(model)
         aux_loss = unwrapped_model.aux_loss()
         accelerator.backward(aux_loss)
@@ -119,27 +204,28 @@ def train_one_epoch(
         
         if dist_key in out_criterion:
             dist_losses.update(out_criterion[dist_key].item())
+            
+        # Log the calculated (but not optimized) MoE loss to monitor balance
+        if "moe_loss" in out_criterion:
+             moe_val = out_criterion["moe_loss"]
+             if isinstance(moe_val, torch.Tensor): moe_val = moe_val.item()
+             moe_metrics.update(moe_val)
 
-        # Log only on main process
         if i % 100 == 0 and accelerator.is_main_process:
              if logger is not None:
                  logger.info(
                     f"Epoch: [{epoch}][{i}/{len(train_dataloader)}]\t"
-                    f"Loss {losses.val:.4f} ({losses.avg:.4f})\t"
-                    f"Bpp {bpp_losses.val:.4f} ({bpp_losses.avg:.4f})\t"
-                    f"Dist {dist_losses.val:.5f} ({dist_losses.avg:.5f})\t"
-                    f"Aux {aux_losses.val:.3f} ({aux_losses.avg:.3f})"
+                    f"Loss {losses.val:.4f}\t"
+                    f"Bpp {bpp_losses.val:.4f}\t"
+                    f"Dist {dist_losses.val:.5f}\t"
+                    f"MoE_Metric {moe_metrics.val:.4f}" # Monitoring only
                 )
              
              if writer is not None:
-                 writer.add_scalar('Train/Loss_Step', out_criterion["loss"].item(), global_step)
-                 writer.add_scalar('Train/Bpp_Step', out_criterion["bpp_loss"].item(), global_step)
-                 writer.add_scalar('Train/Distortion_Step', dist_losses.val, global_step)
-                 writer.add_scalar('Train/Aux_Step', aux_losses.val, global_step)
-                 if "spectral_loss" in out_criterion and out_criterion["spectral_loss"] > 0:
-                     writer.add_scalar('Train/Spectral_Loss_Step', out_criterion["spectral_loss"].item(), global_step)
-                 if "dict_loss" in out_criterion and out_criterion["dict_loss"] > 0:
-                     writer.add_scalar('Train/Dict_Loss_Step', out_criterion["dict_loss"].item(), global_step)
+                 writer.add_scalar('Train/Loss', out_criterion["loss"].item(), global_step)
+                 writer.add_scalar('Train/Bpp', out_criterion["bpp_loss"].item(), global_step)
+                 writer.add_scalar('Train/Distortion', dist_losses.val, global_step)
+                 writer.add_scalar('Train/MoE_Imbalance_Score', moe_metrics.val, global_step)
 
         global_step += 1
 
@@ -152,16 +238,12 @@ def test_epoch(epoch, test_dataloader, model, criterion, accelerator, logger, wr
     bpp_loss_meter = AverageMeter()
     dist_loss_meter = AverageMeter()
     
-    if criterion.loss_type == "mse" or criterion.loss_type == "charbonnier":
-        dist_key = "mse_loss"
-        metric_name = "MSE"
-    else:
-        dist_key = "ms_ssim_loss"
-        metric_name = "MS_SSIM"
+    metric_name = "MSE" if criterion.loss_type in ["mse", "charbonnier"] else "MS_SSIM"
+    dist_key = "mse_loss" if criterion.loss_type == "mse" else "ms_ssim_loss"
+    if criterion.loss_type == "charbonnier": dist_key = "char_loss"
 
     with torch.no_grad():
         for i, d in enumerate(test_dataloader):
-            # Accelerate handles device
             out_net = model(d)
             out_criterion = criterion(out_net, d)
 
@@ -170,17 +252,14 @@ def test_epoch(epoch, test_dataloader, model, criterion, accelerator, logger, wr
             
             if dist_key in out_criterion:
                 dist_loss_meter.update(out_criterion[dist_key].item())
-            elif "char_loss" in out_criterion:
-                 dist_loss_meter.update(out_criterion["char_loss"].item())
 
-            # --- Image Logging (First batch, Main Process Only) ---
             if i == 0 and accelerator.is_main_process and writer is not None:
                 n_imgs = min(4, d.size(0))
                 inputs = d[:n_imgs].cpu()
                 recons = out_net["x_hat"][:n_imgs].cpu().clamp(0, 1)
                 combined = torch.cat([inputs, recons], dim=0)
                 grid = make_grid(combined, nrow=n_imgs, padding=2, normalize=False)
-                writer.add_image('Val_Images/Original_vs_Recon', grid, epoch)
+                writer.add_image('Val_Images', grid, epoch)
 
     if accelerator.is_main_process:
         if logger is not None:
@@ -203,11 +282,11 @@ def save_checkpoint(state, is_best, epoch, save_path, filename="checkpoint.pth.t
         shutil.copyfile(os.path.join(save_path, filename), os.path.join(save_path, "checkpoint_best.pth.tar"))
 
 def parse_args(argv):
-    parser = argparse.ArgumentParser(description="DCAE Training Script (Accelerate)")
+    parser = argparse.ArgumentParser(description="DCAE Loss-Free Training")
     parser.add_argument("-d", "--dataset", type=str, required=True, help="Path to Dataset")
-    parser.add_argument("-e", "--epochs", default=50, type=int)
+    parser.add_argument("-e", "--epochs", default=100, type=int)
     parser.add_argument("-lr", "--learning-rate", default=1e-4, type=float)
-    parser.add_argument("-n", "--num-workers", type=int, default=2)
+    parser.add_argument("-n", "--num-workers", type=int, default=4)
     parser.add_argument("--lambda", dest="lmbda", type=float, default=0.0018)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--test-batch-size", type=int, default=4)
@@ -219,21 +298,19 @@ def parse_args(argv):
     parser.add_argument("--checkpoint", type=str, help="Path to checkpoint")
     parser.add_argument("--type", type=str, default="mse", choices=["mse", "ms-ssim", "charbonnier"])
     parser.add_argument("--save_path", type=str, required=True)
-    parser.add_argument("--lr_epoch", nargs="+", type=int, default=[40, 45])
+    parser.add_argument("--lr_epoch", nargs="+", type=int, default=[80, 90])
     parser.add_argument("--continue_train", action="store_true", default=False)
-    # Accelerate handles mixed precision via 'accelerate config'
-    # but we can accept a flag if we want manual control, though config is better.
+    
+    # Loss-Free Balancing Params
+    parser.add_argument("--update-rate", type=float, default=0.001, help="Update rate for expert biases")
+    
     return parser.parse_args(argv)
 
 def main(argv):
     args = parse_args(argv)
-    
-    # --- 1. Accelerate Init ---
-    # Mixed precision is determined by 'accelerate config' or can be passed here
     accelerator = Accelerator(log_with="tensorboard", project_dir=args.save_path)
     set_seed(args.seed)
 
-    # --- 2. Logging Setup (Main Process Only) ---
     logger = None
     writer = None
     save_path = ""
@@ -241,35 +318,29 @@ def main(argv):
     if accelerator.is_main_process:
         save_path = os.path.join(args.save_path, f"lambda_{args.lmbda}")
         os.makedirs(save_path, exist_ok=True)
-        # We let Accelerator manage the SummaryWriter via 'log_with', 
-        # but to keep your custom logic (images), we access it directly or use our own.
-        # Accelerate's 'get_tracker' is the cleanest way, but standard SummaryWriter works fine on rank 0.
         os.makedirs(os.path.join(save_path, "tensorboard"), exist_ok=True)
         writer = SummaryWriter(os.path.join(save_path, "tensorboard"))
         logger = setup_logger(save_path)
-        logger.info(f"Training started on {accelerator.device}. Mixed Precision: {accelerator.mixed_precision}")
+        logger.info(f"Training started on {accelerator.device}")
 
-    # --- 3. Data Loading ---
+    # Data
     train_transforms = transforms.Compose([transforms.RandomCrop(args.patch_size), transforms.ToTensor()])
     test_transforms = transforms.Compose([transforms.CenterCrop(args.patch_size), transforms.ToTensor()])
 
     train_dataset = ImageFolder(args.dataset, split="train", transform=train_transforms)
     valid_dataset = ImageFolder(args.dataset, split="valid", transform=test_transforms)
 
-    # No need for DistributedSampler, Accelerate handles it!
-    train_dataloader = DataLoader(
-        train_dataset, batch_size=args.batch_size, 
-        num_workers=args.num_workers, shuffle=True, pin_memory=True
-    )
-    valid_dataloader = DataLoader(
-        valid_dataset, batch_size=args.test_batch_size, 
-        num_workers=args.num_workers, shuffle=False, pin_memory=True
-    )
+    train_dataloader = DataLoader(train_dataset, batch_size=args.batch_size, num_workers=args.num_workers, shuffle=True, pin_memory=True)
+    valid_dataloader = DataLoader(valid_dataset, batch_size=args.test_batch_size, num_workers=args.num_workers, shuffle=False, pin_memory=True)
 
-    # --- 4. Model & Optimizer ---
+    # Model
     net = DCAE()
     
-    # Load Checkpoint (Before prepare)
+    # --- Initialize Balancer ---
+    # Assuming standard MoE config (4 experts)
+    # If dynamic, get from net config
+    balancer = LossFreeBalancer(num_experts=4, update_rate=args.update_rate)
+
     start_epoch = 0
     best_loss = float("inf")
     
@@ -278,77 +349,64 @@ def main(argv):
     lr_scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones, gamma=0.1, last_epoch=-1)
     
     if args.checkpoint:
-        if accelerator.is_main_process: logger.info(f"Loading checkpoint: {args.checkpoint}")
-        # Use standard load, accelerate will handle device placement in prepare
         checkpoint = torch.load(args.checkpoint, map_location="cpu")
-        
-        state_dict = checkpoint["state_dict"]
-        # Clean 'module.' prefix if it exists
-        new_state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
-        net.load_state_dict(new_state_dict)
-
+        net.load_state_dict(checkpoint["state_dict"])
         if args.continue_train:
             start_epoch = checkpoint["epoch"] + 1
-            if "optimizer" in checkpoint: optimizer.load_state_dict(checkpoint["optimizer"])
-            # Aux optimizer often not saved/loaded in some pipelines, but good to have
-            if "aux_optimizer" in checkpoint: aux_optimizer.load_state_dict(checkpoint["aux_optimizer"]) 
-            if "lr_scheduler" in checkpoint: lr_scheduler.load_state_dict(checkpoint["lr_scheduler"])
-            if "loss" in checkpoint: best_loss = checkpoint["loss"]
+            optimizer.load_state_dict(checkpoint["optimizer"])
+            aux_optimizer.load_state_dict(checkpoint["aux_optimizer"])
+            lr_scheduler.load_state_dict(checkpoint["lr_scheduler"])
+            best_loss = checkpoint["loss"]
 
-    criterion = RateDistortionLoss(lmbda=args.lmbda, loss_type=args.type, use_loss_free_balancing=True)
+    # --- Loss Config ---
+    # ENABLE Loss-Free: use_loss_free_balancing=True
+    # This prevents RateDistortionLoss from adding moe_loss to gradients
+    criterion = RateDistortionLoss(
+        lmbda=args.lmbda, 
+        loss_type=args.type, 
+        alpha_moe=1.0, 
+        use_loss_free_balancing=True 
+    )
 
-    # --- 5. Accelerate Prepare ---
-    # Magic happens here. 
-    # NOTE: Do NOT prepare aux_optimizer if it only works on non-differentiable params in a specific way, 
-    # but usually safe to prepare. For CompressAI, aux_optimizer updates quantiles.
     net, optimizer, aux_optimizer, train_dataloader, valid_dataloader, lr_scheduler = accelerator.prepare(
         net, optimizer, aux_optimizer, train_dataloader, valid_dataloader, lr_scheduler
     )
 
     global_step = 0
     
-    # --- 6. Train Loop ---
     for epoch in range(start_epoch, args.epochs):
-        
         if accelerator.is_main_process:
-            current_lr = optimizer.param_groups[0]['lr']
-            writer.add_scalar('Train/LR', current_lr, epoch)
-            logger.info(f"Start Epoch {epoch} | LR: {current_lr}")
+            logger.info(f"Epoch {epoch} | LR: {optimizer.param_groups[0]['lr']}")
 
+        # Pass balancer to train loop
         global_step = train_one_epoch(
             net, criterion, train_dataloader, optimizer, aux_optimizer,
-            epoch, args.clip_max_norm, accelerator, logger, writer, global_step
+            epoch, args.clip_max_norm, accelerator, logger, writer, global_step,
+            balancer=balancer
         )
 
         loss = test_epoch(epoch, valid_dataloader, net, criterion, accelerator, logger, writer)
 
-        # Save State
         if accelerator.is_main_process:
             is_best = loss < best_loss
             best_loss = min(loss, best_loss)
-
             if args.save:
-                # Unwrap model to save clean state dict
-                unwrapped_net = accelerator.unwrap_model(net)
                 save_checkpoint(
                     {
                         "epoch": epoch,
-                        "state_dict": unwrapped_net.state_dict(),
+                        "state_dict": accelerator.unwrap_model(net).state_dict(),
                         "loss": loss,
                         "optimizer": optimizer.state_dict(),
                         "aux_optimizer": aux_optimizer.state_dict(),
                         "lr_scheduler": lr_scheduler.state_dict(),
                     },
-                    is_best,
-                    epoch,
-                    save_path
+                    is_best, epoch, save_path
                 )
 
         lr_scheduler.step()
     
     if accelerator.is_main_process:
         writer.close()
-        logger.info("Training Complete.")
 
 if __name__ == "__main__":
     main(sys.argv[1:])
