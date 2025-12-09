@@ -65,7 +65,7 @@ class LossFreeBalancer:
                 _, topk_indices = torch.topk(logits, k=2, dim=-1)
 
             # 1. Flatten indices to count globally
-            flat_indices = topk_indices.view(-1)
+            flat_indices = topk_indices.contiguous().view(-1)
             
             # 2. Local Counts (on this GPU)
             local_counts = torch.bincount(flat_indices, minlength=self.num_experts).float()

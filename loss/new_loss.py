@@ -111,7 +111,7 @@ def load_balancing_loss_func(
         # 4. Hard Selection (Load) using Indices
         # selected_indices shape: [N, k]
         # Flatten indices: [N*k]
-        flat_indices = selected_indices.view(-1)
+        flat_indices = selected_indices.contiguous().view(-1)
         
         # Count occurrences (Load per expert)
         expert_counts = torch.bincount(flat_indices, minlength=num_experts).float()

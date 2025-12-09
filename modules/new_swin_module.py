@@ -67,8 +67,8 @@ class WMSA(nn.Module):
 
         sim = torch.einsum("hbwpc,hbwqc->hbwpq", q, k) * self.scale
         relative_position_bias = self.relative_position_params[
-            self.relative_position_index.view(-1)
-        ].view(self.window_size * self.window_size, self.window_size * self.window_size, -1)
+            self.relative_position_index.contiguous().view(-1)
+        ].contiguous().view(self.window_size * self.window_size, self.window_size * self.window_size, -1)
         relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()
         
         # Broadcast bias correctly over Batch (dim 1) and NumWindows (dim 2)
@@ -304,13 +304,13 @@ class InverseLearnableWaveletTransform(nn.Module):
             # even: [B, C, H, W] -> Stack dim 3 -> [B, C, H, 2, W] -> View -> [B, C, H*2, W]
             B, C, H, W = even.shape
             combined = torch.stack((even, odd), dim=3)
-            return combined.view(B, C, H * 2, W)
+            return combined.contiguous().view(B, C, H * 2, W)
             
         else: # Width reconstruction
             # even: [B, C, H, W] -> Stack dim 4 -> [B, C, H, W, 2] -> View -> [B, C, H, W*2]
             B, C, H, W = even.shape
             combined = torch.stack((even, odd), dim=4)
-            return combined.view(B, C, H, W * 2)
+            return combined.contiguous().view(B, C, H, W * 2)
 
     def forward(self, ll, hf):
         C = ll.shape[1]
@@ -421,7 +421,7 @@ class SpectralMoEDictionaryCrossAttention(nn.Module):
         self.last_routing_logits = routing_logits 
         
         # 2. Apply Loss-Free Balancing Bias
-        biased_logits = routing_logits + self.expert_biases.view(1, 1, 1, -1)
+        biased_logits = routing_logits + self.expert_biases.contiguous().view(1, 1, 1, -1)
         
         # --- OPTIMIZATION: Calculate Top-K Once ---
         # We calculate indices here and save them. 
@@ -438,23 +438,23 @@ class SpectralMoEDictionaryCrossAttention(nn.Module):
         # 3. Expert Attention
         all_keys = self.k_high(self.ln_dict_high(self.experts_high))
         q = self.q_high(self.ln_high(hf))
-        q_flat = q.view(B, -1, C_high)
+        q_flat = q.contiguous().view(B, -1, C_high)
 
         # Efficient Matmul
         sim = torch.matmul(q_flat, all_keys.transpose(0, 1)) * (C_high ** -0.5)
-        sim = sim.view(B, H*W, self.num_experts, -1)
+        sim = sim.contiguous().view(B, H*W, self.num_experts, -1)
         attn = F.softmax(sim, dim=-1)
         
         v_all = self.v_all(self.experts_high)
-        v_experts = v_all.view(self.num_experts, -1, C_high)
+        v_experts = v_all.contiguous().view(self.num_experts, -1, C_high)
         
         expert_outputs = torch.einsum("bhke,kec->bhkc", attn, v_experts)
         
         # 4. Router Weighting
-        router_weights_flat = routing_weights.view(B, H*W, self.num_experts, 1)
+        router_weights_flat = routing_weights.contiguous().view(B, H*W, self.num_experts, 1)
         final_out = (expert_outputs * router_weights_flat).sum(dim=2)
         
-        return final_out.view(B, H, W, C_high)
+        return final_out.contiguous().view(B, H, W, C_high)
 
     def forward(self, x):
         # x is NCHW
