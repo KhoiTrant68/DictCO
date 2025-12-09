@@ -49,7 +49,7 @@ class WMSA(nn.Module):
         attn_mask[-1, :, s:, :, :s, :] = True
         attn_mask[:, -1, :, :s, :, s:] = True
         attn_mask[:, -1, :, s:, :, :s] = True
-        attn_mask = rearrange(attn_mask, "w1 w2 p1 p2 p3 p4 -> 1 1 (w1 w2) (p1 p2) (p3 p4)")
+        attn_mask = rearrange(attn_mask, "w1 w2 p1 p2 p3 p4 -> 1 1 (w1 w2) (p1 p2) (p3 p4)").contiguous()
         return attn_mask
 
     def forward(self, x):
@@ -62,7 +62,7 @@ class WMSA(nn.Module):
         x = rearrange(x, "b w1 w2 p1 p2 c -> b (w1 w2) (p1 p2) c", p1=self.window_size, p2=self.window_size).contiguous()
 
         qkv = self.embedding_layer(x)
-        q, k, v = rearrange(qkv, "b nw np (threeh c) -> threeh b nw np c", c=self.head_dim).chunk(3, dim=0)
+        q, k, v = rearrange(qkv, "b nw np (threeh c) -> threeh b nw np c", c=self.head_dim).chunk(3, dim=0).contiguous()
 
         sim = torch.einsum("hbwpc,hbwqc->hbwpq", q, k) * self.scale
         relative_position_bias = self.relative_position_params[
@@ -79,9 +79,9 @@ class WMSA(nn.Module):
 
         probs = nn.functional.softmax(sim, dim=-1)
         output = torch.einsum("hbwij,hbwjc->hbwic", probs, v)
-        output = rearrange(output, "h b w p c -> b w p (h c)")
+        output = rearrange(output, "h b w p c -> b w p (h c)").contiguous()
         output = self.linear(output)
-        output = rearrange(output, "b (w1 w2) (p1 p2) c -> b (w1 p1) (w2 p2) c", w1=h_windows, p1=self.window_size)
+        output = rearrange(output, "b (w1 w2) (p1 p2) c -> b (w1 p1) (w2 p2) c", w1=h_windows, p1=self.window_size).contiguous()
 
         if self.type == "W":
             output = torch.roll(output, shifts=(self.window_size // 2, self.window_size // 2), dims=(1, 2))
