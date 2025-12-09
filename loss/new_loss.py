@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
-from typing import Optional, Union, Tuple
+from typing import List, Union, Tuple
 
 # Try importing MS-SSIM
 try:
@@ -56,49 +56,80 @@ class FocalFrequencyLoss(nn.Module):
 #  OPTIMIZED LOAD BALANCING (Simplified for Images)
 # ==============================================================================
 def load_balancing_loss_func(
-    gate_data, 
-    num_experts: int, 
+    gate_logits: Union[torch.Tensor, List[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]]],
+    num_experts: int,
     top_k: int = 2
 ) -> torch.Tensor:
     """
     Computes auxiliary load balancing loss.
-    Accepts gate_data as either `logits` or tuple `(logits, indices)`.
+    Accepts gate_logits as:
+      1. A single Tensor [N, Experts]
+      2. A List of Tensors (one per layer)
+      3. A List of Tuples (logits, indices) (one per layer, optimized)
     """
-    if gate_data is None:
+    if gate_logits is None:
         return torch.tensor(0.0)
 
-    # Handle Input Format
-    if isinstance(gate_data, (tuple, list)) and len(gate_data) == 2:
-        gate_logits, selected_indices = gate_data
-    else:
-        gate_logits = gate_data
-        # Standard calculation if indices missing
-        _, selected_indices = torch.topk(gate_logits, top_k, dim=-1)
-
+    # 1. Normalize input to a list of items
+    # If it's a single tensor, wrap it
     if isinstance(gate_logits, torch.Tensor):
-        gate_logits = [gate_logits] # Normalize to list for loop if needed
-        # (Assuming the caller unwraps the tuple before calling, or we handle single tensor)
+        layer_outputs = [gate_logits]
+    # If it's a tuple (logits, indices) representing a single layer, wrap it
+    elif isinstance(gate_logits, tuple) and len(gate_logits) == 2 and isinstance(gate_logits[0], torch.Tensor):
+         layer_outputs = [gate_logits]
+    else:
+        # It's already a list (of tensors or tuples)
+        layer_outputs = gate_logits
 
-    # Flatten Logits for Softmax
-    # gate_logits shape: [N, E]
-    
-    # 1. Softmax (Probabilities)
-    probs = torch.softmax(gate_logits, dim=-1)
-    mean_probs = torch.mean(probs, dim=0) # [Experts]
+    if len(layer_outputs) == 0:
+        return torch.tensor(0.0)
 
-    # 2. Hard Selection (Load) using Pre-calculated Indices
-    # Convert indices to one-hot and sum
-    # selected_indices shape: [N, k]
-    expert_mask = torch.nn.functional.one_hot(selected_indices, num_experts).float()
-    expert_mask = expert_mask.sum(dim=1) # Sum over k -> [N, Experts]
-    
-    # Calculate fraction of tokens per expert
-    fraction_tokens = torch.mean(expert_mask, dim=0) # [Experts]
+    total_loss = 0.0
 
-    # 3. Switch Transformer Loss: N * sum(f_i * P_i)
-    loss = num_experts * torch.sum(mean_probs * fraction_tokens)
-    
-    return loss
+    # 2. Iterate over each MoE layer
+    for item in layer_outputs:
+        # Check if item is (logits, indices) or just logits
+        if isinstance(item, (tuple, list)) and len(item) == 2:
+            logits, selected_indices = item
+        else:
+            logits = item
+            # Fallback: Calculate Top-K if indices are missing
+            _, selected_indices = torch.topk(logits, top_k, dim=-1)
+
+        # Ensure logits are on the correct device for loss calculation
+        if logits.numel() == 0:
+            continue
+
+        # Flatten logits: [B, H, W, E] -> [N, E]
+        if logits.dim() > 2:
+            logits = logits.reshape(-1, num_experts)
+            
+        # 3. Softmax (Probabilities)
+        probs = torch.softmax(logits, dim=-1)
+        mean_probs = torch.mean(probs, dim=0) # [Experts]
+
+        # 4. Hard Selection (Load) using Indices
+        # selected_indices shape: [N, k]
+        # Flatten indices: [N*k]
+        flat_indices = selected_indices.view(-1)
+        
+        # Count occurrences (Load per expert)
+        expert_counts = torch.bincount(flat_indices, minlength=num_experts).float()
+        
+        # Fraction of tokens per expert
+        # Note: We divide by total top-k selections (N * k)
+        total_selections = flat_indices.numel()
+        if total_selections > 0:
+            fraction_tokens = expert_counts / total_selections
+        else:
+            fraction_tokens = torch.zeros_like(mean_probs)
+
+        # 5. Switch Transformer Loss: N * sum(f_i * P_i)
+        # We multiply by num_experts so perfect balance = 1.0
+        loss = num_experts * torch.sum(mean_probs * fraction_tokens)
+        total_loss += loss
+
+    return total_loss
 
 # ==============================================================================
 #  MAIN LOSS MODULE
