@@ -295,7 +295,7 @@ def main(argv):
             if "lr_scheduler" in checkpoint: lr_scheduler.load_state_dict(checkpoint["lr_scheduler"])
             if "loss" in checkpoint: best_loss = checkpoint["loss"]
 
-    criterion = RateDistortionLoss(lmbda=args.lmbda, loss_type=args.type)
+    criterion = RateDistortionLoss(lmbda=args.lmbda, loss_type=args.type, use_loss_free_balancing=True)
 
     # --- 5. Accelerate Prepare ---
     # Magic happens here. 

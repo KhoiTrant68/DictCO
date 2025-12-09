@@ -10,23 +10,6 @@ try:
 except ImportError:
     ms_ssim = None
 
-class AverageMeter:
-    """Compute running average."""
-    def __init__(self):
-        self.reset()
-
-    def reset(self):
-        self.val = 0
-        self.avg = 0
-        self.sum = 0
-        self.count = 0
-
-    def update(self, val, n=1):
-        self.val = val
-        self.sum += val * n
-        self.count += n
-        self.avg = self.sum / self.count
-
 class CharbonnierLoss(nn.Module):
     """Robust L1 Loss (differentiable L1)."""
     def __init__(self, eps=1e-3):
@@ -53,107 +36,70 @@ class FocalFrequencyLoss(nn.Module):
         return (diff * weight).mean()
 
 # ==============================================================================
-#  YOUR LOAD BALANCING FUNCTION (Adapted for Image Compression)
+#  OPTIMIZED LOAD BALANCING (Simplified for Images)
 # ==============================================================================
 def load_balancing_loss_func(
     gate_logits: Union[torch.Tensor, Tuple[torch.Tensor]], 
     num_experts: int, 
-    top_k: int = 2, 
-    attention_mask: Optional[torch.Tensor] = None
+    top_k: int = 2
 ) -> torch.Tensor:
-    r"""
-    Computes auxiliary load balancing loss (Switch Transformer style).
-    Adapted to handle Image Compression tensors (B, H, W, Experts).
     """
-    # If input is a single tensor (one MoE layer), wrap it in a tuple/list
+    Computes auxiliary load balancing loss.
+    Simplified for Image Compression (No Attention Mask needed).
+    """
     if isinstance(gate_logits, torch.Tensor):
         gate_logits = [gate_logits]
         
     if gate_logits is None or len(gate_logits) == 0:
         return torch.tensor(0.0)
 
-    # Assume all layers are on the same device
-    if isinstance(gate_logits, tuple):
-        compute_device = gate_logits[0].device
-    else: # List
-        compute_device = gate_logits[0].device
-
-    layer_aux_loss = []
+    total_loss = 0.0
     
-    for layer_gate in gate_logits:
-        # layer_gate shape usually: [Batch, H, W, NumExperts] or [Batch, SeqLen, NumExperts]
-        # We need to flatten batch and spatial dimensions for calculation
-        if layer_gate.dim() == 4: # Image case: (B, H, W, E)
-            layer_gate = layer_gate.view(-1, num_experts)
-        elif layer_gate.dim() == 3: # Seq case: (B, L, E)
-            layer_gate = layer_gate.view(-1, num_experts)
-            
-        # 1. Softmax to get probabilities
-        routing_weights = torch.nn.functional.softmax(layer_gate, dim=-1)
-
-        # 2. Get Top-K selections
-        # Note: If top_k is larger than num_experts, clamp it
-        k = min(top_k, num_experts)
-        _, selected_experts = torch.topk(routing_weights, k, dim=-1)
-
-        # 3. Create Mask (One-hot encoding of selected experts)
-        # shape: [TotalTokens, k, NumExperts]
-        expert_mask = torch.nn.functional.one_hot(selected_experts, num_experts)
-
-        if attention_mask is None:
-            # Flatten expert mask to [TotalTokens, NumExperts]
-            # Since a token can select k experts, we sum the one-hots
-            # (or mean depending on specific implementation, Switch Transformer usually sums for load)
-            tokens_per_expert = torch.mean(torch.sum(expert_mask.float(), dim=1), dim=0)
-
-            # Average probability routed to each expert
-            router_prob_per_expert = torch.mean(routing_weights, dim=0)
-        else:
-            # Handle attention mask if needed (usually None for Image Compression)
-            # Flatten mask to [TotalTokens]
-            flat_mask = attention_mask.view(-1).to(compute_device)
-            
-            # Mask out padding tokens
-            valid_tokens = torch.sum(flat_mask)
-            
-            # Weighted mean for tokens routed
-            # Sum over top-k selections
-            expert_selection_flat = torch.sum(expert_mask.float(), dim=1) 
-            tokens_per_expert = torch.sum(expert_selection_flat * flat_mask.unsqueeze(1), dim=0) / (valid_tokens + 1e-6)
-
-            # Weighted mean for router probs
-            router_prob_per_expert = torch.sum(routing_weights * flat_mask.unsqueeze(1), dim=0) / (valid_tokens + 1e-6)
-
-        # 4. Compute Loss: N * sum(f_i * P_i)
-        overall_loss = torch.sum(tokens_per_expert * router_prob_per_expert) * num_experts
-        layer_aux_loss.append(overall_loss)
-    
-    if len(layer_aux_loss) == 0:
-        return torch.tensor(0.0, device=compute_device)
+    for logits in gate_logits:
+        # Flatten: [B, H, W, E] -> [N, E]
+        logits = logits.reshape(-1, num_experts)
         
-    return sum(layer_aux_loss)
+        # 1. Softmax to get probabilities (Router Confidence)
+        # P_i: Fraction of probability mass allocated to expert i
+        probs = torch.softmax(logits, dim=-1)
+        mean_probs = torch.mean(probs, dim=0) # [Experts]
+
+        # 2. Hard Selection (Load)
+        # f_i: Fraction of tokens that actually selected expert i
+        # We look at top-k selections
+        _, selected_indices = torch.topk(logits, top_k, dim=-1)
+        
+        # Convert indices to one-hot and sum over k (a token counts for multiple experts)
+        # shape: [N, Experts]
+        expert_mask = F.one_hot(selected_indices, num_experts).float().sum(dim=1)
+        
+        # Calculate fraction of tokens per expert
+        fraction_tokens = torch.mean(expert_mask, dim=0) # [Experts]
+
+        # 3. Switch Transformer Loss: N * sum(f_i * P_i)
+        # We multiply by num_experts so perfect balance = 1.0 (ideally)
+        loss = num_experts * torch.sum(mean_probs * fraction_tokens)
+        total_loss += loss
+    
+    return total_loss
 
 # ==============================================================================
 #  MAIN LOSS MODULE
 # ==============================================================================
 class RateDistortionLoss(nn.Module):
-    """
-    Main Objective: R + lambda * D + Aux_Loss(Spectral + MoE)
-    """
     def __init__(self, lmbda=1e-2, loss_type="mse", 
                  alpha_spectral=0.1, alpha_moe=0.01,
-                 num_experts=4, top_k=2):
+                 num_experts=4, top_k=2,
+                 use_loss_free_balancing=True): # <--- NEW FLAG
         super().__init__()
         self.lmbda = lmbda
         self.loss_type = loss_type
         self.alpha_spectral = alpha_spectral
         self.alpha_moe = alpha_moe
-        
-        # MoE specific params
         self.num_experts = num_experts
         self.top_k = top_k
+        self.use_loss_free_balancing = use_loss_free_balancing
 
-        # Sub-losses
         self.mse = nn.MSELoss()
         self.charbonnier = CharbonnierLoss()
         self.ffl = FocalFrequencyLoss()
@@ -165,15 +111,12 @@ class RateDistortionLoss(nn.Module):
 
         # --- 1. Rate Loss (BPP) ---
         y_lik = output["likelihoods"]["y"]
-        # Handle single tensor or list (from uneven slicing)
-        if isinstance(y_lik, list) or isinstance(y_lik, tuple):
-            # Sum log-likelihoods across all slices
+        if isinstance(y_lik, (list, tuple)):
             total_y_bpp = sum(-torch.log(y_l).sum() for y_l in y_lik)
         else:
             total_y_bpp = -torch.log(y_lik).sum()
 
         bpp_z = -torch.log(output["likelihoods"]["z"]).sum()
-        
         out["bpp_loss"] = (total_y_bpp + bpp_z) / (math.log(2) * num_pixels)
 
         # --- 2. Main Distortion ---
@@ -204,24 +147,26 @@ class RateDistortionLoss(nn.Module):
             total_aux += self.alpha_spectral * ffl_val
 
         # B. MoE Load Balancing
-        # Check if model returned 'router_logits' (Preferred for this loss func)
+        # We always CALCULATE it for monitoring, but we check if we ADD it.
         if self.alpha_moe > 0:
-            # In dcae_final.py, ensure you return 'router_logits' in the output dict
-            # If your model returns 'aux_loss' directly, use that. 
-            # If it returns logits, calculate it here.
-            
-            if "router_logits" in output:
+            moe_loss = 0
+            if "router_logits" in output and output["router_logits"] is not None:
                 moe_loss = load_balancing_loss_func(
                     output["router_logits"], 
                     num_experts=self.num_experts, 
                     top_k=self.top_k
                 )
-                out["moe_loss"] = moe_loss
+            
+            out["moe_loss"] = moe_loss
+            
+            # --- CRITICAL LOGIC ---
+            if self.use_loss_free_balancing:
+                # If using Loss-Free (Bias Updates), do NOT add to gradient.
+                # We just log it to see if it remains low.
+                pass 
+            else:
+                # If NOT using Loss-Free, add to gradient to force balance via SGD.
                 total_aux += self.alpha_moe * moe_loss
-            elif "aux_loss" in output:
-                # Fallback if model calculated it internally
-                out["moe_loss"] = output["aux_loss"]
-                total_aux += output["aux_loss"] # alpha already applied in model? check logic
 
         out["aux_loss"] = total_aux
 
