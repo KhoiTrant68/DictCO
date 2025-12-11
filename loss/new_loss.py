@@ -1,6 +1,5 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import math
 from typing import List, Union, Tuple
 
@@ -38,55 +37,39 @@ class CharbonnierLoss(nn.Module):
         loss = torch.sqrt(diff * diff + self.eps * self.eps)
         return torch.mean(loss)
 
-class FocalFrequencyLoss(nn.Module):
-    """Weights frequency bands based on difficulty (Spectral Loss)."""
-    def __init__(self, alpha=1.0):
-        super().__init__()
-        self.alpha = alpha
-
-    def forward(self, pred, target):
-        pred_freq = torch.fft.rfft2(pred, norm='ortho')
-        target_freq = torch.fft.rfft2(target, norm='ortho')
-        diff = (pred_freq.abs() - target_freq.abs()).pow(2)
-        weight = diff / (diff.mean() + 1e-8)
-        weight = torch.clamp(weight, min=0.1, max=10.0) ** self.alpha
-        return (diff * weight).mean()
-
 # ==============================================================================
-#  OPTIMIZED LOAD BALANCING (Simplified for Images)
+#  OPTIMIZED LOAD BALANCING (Supports Tuple inputs)
 # ==============================================================================
 def load_balancing_loss_func(
-    gate_logits: Union[torch.Tensor, List[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]]],
+    gate_data: Union[torch.Tensor, List[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]]],
     num_experts: int,
     top_k: int = 2
 ) -> torch.Tensor:
     """
     Computes auxiliary load balancing loss.
-    Accepts gate_logits as:
-      1. A single Tensor [N, Experts]
-      2. A List of Tensors (one per layer)
-      3. A List of Tuples (logits, indices) (one per layer, optimized)
+    
+    Optimized to handle 'gate_data' in two formats:
+      1. Logits only: [N, Experts] -> Calculates TopK internally (Slower).
+      2. Tuple: (Logits, Indices) -> Uses pre-calculated indices (Faster).
     """
-    if gate_logits is None:
+    if gate_data is None:
         return torch.tensor(0.0)
 
-    # 1. Normalize input to a list of items
-    # If it's a single tensor, wrap it
-    if isinstance(gate_logits, torch.Tensor):
-        layer_outputs = [gate_logits]
-    # If it's a tuple (logits, indices) representing a single layer, wrap it
-    elif isinstance(gate_logits, tuple) and len(gate_logits) == 2 and isinstance(gate_logits[0], torch.Tensor):
-         layer_outputs = [gate_logits]
+    # Normalize input to a list
+    if isinstance(gate_data, torch.Tensor):
+        layer_outputs = [gate_data]
+    elif isinstance(gate_data, tuple) and len(gate_data) == 2 and isinstance(gate_data[0], torch.Tensor):
+        # Single layer tuple
+        layer_outputs = [gate_data]
     else:
-        # It's already a list (of tensors or tuples)
-        layer_outputs = gate_logits
+        # Already a list
+        layer_outputs = gate_data
 
     if len(layer_outputs) == 0:
         return torch.tensor(0.0)
 
     total_loss = 0.0
 
-    # 2. Iterate over each MoE layer
     for item in layer_outputs:
         # Check if item is (logits, indices) or just logits
         if isinstance(item, (tuple, list)) and len(item) == 2:
@@ -94,38 +77,38 @@ def load_balancing_loss_func(
         else:
             logits = item
             # Fallback: Calculate Top-K if indices are missing
+            # This happens if the model didn't return indices
             _, selected_indices = torch.topk(logits, top_k, dim=-1)
 
-        # Ensure logits are on the correct device for loss calculation
+        # Skip empty tensors
         if logits.numel() == 0:
             continue
 
-        # Flatten logits: [B, H, W, E] -> [N, E]
+        # Flatten logits: [B, H, W, E] -> [N, E] if needed for softmax
         if logits.dim() > 2:
-            logits = logits.reshape(-1, num_experts)
+            logits_flat = logits.reshape(-1, num_experts)
+        else:
+            logits_flat = logits
             
-        # 3. Softmax (Probabilities)
-        probs = torch.softmax(logits, dim=-1)
+        # 1. Softmax (Probabilities) - The "Gate"
+        probs = torch.softmax(logits_flat, dim=-1)
         mean_probs = torch.mean(probs, dim=0) # [Experts]
 
-        # 4. Hard Selection (Load) using Indices
-        # selected_indices shape: [N, k]
-        # Flatten indices: [N*k]
+        # 2. Hard Selection (Load) using Indices
         flat_indices = selected_indices.contiguous().view(-1)
         
         # Count occurrences (Load per expert)
         expert_counts = torch.bincount(flat_indices, minlength=num_experts).float()
         
         # Fraction of tokens per expert
-        # Note: We divide by total top-k selections (N * k)
         total_selections = flat_indices.numel()
         if total_selections > 0:
             fraction_tokens = expert_counts / total_selections
         else:
             fraction_tokens = torch.zeros_like(mean_probs)
 
-        # 5. Switch Transformer Loss: N * sum(f_i * P_i)
-        # We multiply by num_experts so perfect balance = 1.0
+        # 3. Switch Transformer Loss: N * sum(f_i * P_i)
+        # We multiply by num_experts so perfect balance = 1.0 (minimum is 1.0)
         loss = num_experts * torch.sum(mean_probs * fraction_tokens)
         total_loss += loss
 
@@ -136,13 +119,12 @@ def load_balancing_loss_func(
 # ==============================================================================
 class RateDistortionLoss(nn.Module):
     def __init__(self, lmbda=1e-2, loss_type="mse", 
-                 alpha_spectral=0.1, alpha_moe=0.01,
+                 alpha_moe=0.01,
                  num_experts=4, top_k=2,
-                 use_loss_free_balancing=True): # <--- NEW FLAG
+                 use_loss_free_balancing=True):
         super().__init__()
         self.lmbda = lmbda
         self.loss_type = loss_type
-        self.alpha_spectral = alpha_spectral
         self.alpha_moe = alpha_moe
         self.num_experts = num_experts
         self.top_k = top_k
@@ -150,55 +132,66 @@ class RateDistortionLoss(nn.Module):
 
         self.mse = nn.MSELoss()
         self.charbonnier = CharbonnierLoss()
-        self.ffl = FocalFrequencyLoss()
 
     def forward(self, output, target):
+        """
+        output: Dictionary containing:
+            - "x_hat": Reconstructed image
+            - "likelihoods": {"y": ..., "z": ...}
+            - "router_logits": List of (logits, indices) or logits
+        """
         N, _, H, W = target.size()
         num_pixels = N * H * W
         out = {}
 
         # --- 1. Rate Loss (BPP) ---
         y_lik = output["likelihoods"]["y"]
+        z_lik = output["likelihoods"]["z"]
+        
+        # Sum logs first for numerical stability
         if isinstance(y_lik, (list, tuple)):
-            total_y_bpp = sum(-torch.log(y_l).sum() for y_l in y_lik)
+            # If y is split into slices
+            total_y_log_lik = sum(torch.log(y_l).sum() for y_l in y_lik)
         else:
-            total_y_bpp = -torch.log(y_lik).sum()
+            total_y_log_lik = torch.log(y_lik).sum()
 
-        bpp_z = -torch.log(output["likelihoods"]["z"]).sum()
-        out["bpp_loss"] = (total_y_bpp + bpp_z) / (math.log(2) * num_pixels)
+        total_z_log_lik = torch.log(z_lik).sum()
+        
+        # BPP = -log2(likelihood) / pixels
+        out["bpp_loss"] = (-total_y_log_lik - total_z_log_lik) / (math.log(2) * num_pixels)
 
-        # --- 2. Main Distortion ---
+        # --- 2. Distortion Loss ---
         x_hat = output["x_hat"]
         
         if self.loss_type == "mse":
             out["mse_loss"] = self.mse(x_hat, target)
+            # CompressAI convention: scale MSE by 255^2
             dist_loss = 255**2 * out["mse_loss"]
+            
         elif self.loss_type == "charbonnier":
             out["char_loss"] = self.charbonnier(x_hat, target)
             dist_loss = 255**2 * out["char_loss"]
+            
         elif self.loss_type == "ms_ssim":
-            if ms_ssim is None: raise ImportError("pytorch_msssim not installed")
+            if ms_ssim is None: 
+                raise ImportError("pytorch_msssim not installed. Install it or use 'mse'.")
+            # MS-SSIM is max 1.0, so loss is 1 - MS-SSIM
             out["ms_ssim_loss"] = 1 - ms_ssim(x_hat, target, data_range=1.0)
             dist_loss = 255**2 * out["ms_ssim_loss"] 
+            
         else:
             raise ValueError(f"Unknown metric: {self.loss_type}")
 
         out["dist_loss"] = dist_loss
 
-        # --- 3. Auxiliary Losses ---
-        total_aux = 0
-
-        # A. Spectral Loss
-        if self.alpha_spectral > 0:
-            ffl_val = self.ffl(x_hat, target)
-            out["spectral_loss"] = ffl_val
-            total_aux += self.alpha_spectral * ffl_val
-
-        # B. MoE Load Balancing
-        # We always CALCULATE it for monitoring, but we check if we ADD it.
+        # --- 3. Auxiliary Loss (MoE Balancing) ---
+        total_aux = 0.0
+        
+        # We calculate this if alpha > 0, either for logging or for gradient
         if self.alpha_moe > 0:
-            moe_loss = 0
+            moe_loss = 0.0
             if "router_logits" in output and output["router_logits"] is not None:
+                # This function now handles the Tuple(logits, indices) efficiently
                 moe_loss = load_balancing_loss_func(
                     output["router_logits"], 
                     num_experts=self.num_experts, 
@@ -207,18 +200,20 @@ class RateDistortionLoss(nn.Module):
             
             out["moe_loss"] = moe_loss
             
-            # --- CRITICAL LOGIC ---
+            # --- CRITICAL LOGIC FOR LOSS-FREE BALANCING ---
             if self.use_loss_free_balancing:
-                # If using Loss-Free (Bias Updates), do NOT add to gradient.
-                # We just log it to see if it remains low.
+                # 1. "Loss-Free": We do NOT add this to the gradient.
+                #    The balancing happens via Bias Updates in the optimizer loop.
+                #    We record it in 'out' only for Tensorboard logging.
                 pass 
             else:
-                # If NOT using Loss-Free, add to gradient to force balance via SGD.
+                # 2. "Standard": Add to gradient to force Softmax weights to balance.
                 total_aux += self.alpha_moe * moe_loss
 
         out["aux_loss"] = total_aux
 
         # --- 4. Total Loss ---
+        # Loss = Rate + Lambda * (Distortion + Aux)
         out["loss"] = out["bpp_loss"] + self.lmbda * (dist_loss + total_aux)
 
         return out

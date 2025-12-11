@@ -41,7 +41,6 @@ class LossFreeBalancer:
     def __init__(self, num_experts, update_rate=0.001):
         self.num_experts = num_experts
         self.update_rate = update_rate
-        # We don't store biases here permanently; we read/write to the model's buffers
 
     @torch.no_grad()
     def update_model_biases(self, model, router_data_tuple, accelerator=None):
@@ -55,14 +54,10 @@ class LossFreeBalancer:
             return
 
         for i, layer_data in enumerate(router_data_tuple):
-            # Check if we have pre-calculated indices (Tuple) or just logits (Tensor)
-            # The optimized Swin module returns (logits, indices)
             if isinstance(layer_data, (tuple, list)) and len(layer_data) == 2:
-                logits, topk_indices = layer_data
+                _, topk_indices = layer_data
             else:
-                logits = layer_data
-                # Fallback: Calculate Top-K if not provided (k=2 assumption based on config)
-                _, topk_indices = torch.topk(logits, k=2, dim=-1)
+                continue
 
             # 1. Flatten indices to count globally
             flat_indices = topk_indices.contiguous().view(-1)
@@ -71,7 +66,7 @@ class LossFreeBalancer:
             local_counts = torch.bincount(flat_indices, minlength=self.num_experts).float()
             
             # 3. Global Synchronization (CRITICAL FOR DDP)
-            if accelerator is not None and accelerator.num_processes > 1:
+            if accelerator and accelerator.num_processes > 1:
                 # Sum counts across all GPUs so every GPU sees the global load
                 expert_counts = accelerator.reduce(local_counts, reduction="sum")
             else:
@@ -142,15 +137,15 @@ def configure_optimizers(net, args):
 def train_one_epoch(
     model, criterion, train_dataloader, optimizer, aux_optimizer, 
     epoch, clip_max_norm, accelerator, logger, writer, global_step,
-    balancer # <--- NEW Argument
+    balancer
 ):
     model.train()
     
     losses = AverageMeter()
     bpp_losses = AverageMeter()
     dist_losses = AverageMeter()
-    aux_losses = AverageMeter() # Quantile loss
-    moe_metrics = AverageMeter() # Just for logging
+    aux_losses = AverageMeter()
+    moe_metrics = AverageMeter()
     
     if criterion.loss_type == "mse":
         dist_key = "mse_loss"
@@ -294,9 +289,9 @@ def parse_args(argv):
     parser.add_argument("-d", "--dataset", type=str, required=True, help="Path to Dataset")
     parser.add_argument("-e", "--epochs", default=100, type=int)
     parser.add_argument("-lr", "--learning-rate", default=1e-4, type=float)
-    parser.add_argument("-n", "--num-workers", type=int, default=4)
+    parser.add_argument("-n", "--num-workers", type=int, default=1)
     parser.add_argument("--lambda", dest="lmbda", type=float, default=0.0018)
-    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--test-batch-size", type=int, default=4)
     parser.add_argument("--aux-learning-rate", default=1e-3, type=float)
     parser.add_argument("--patch-size", type=int, nargs=2, default=(256, 256))
@@ -304,7 +299,7 @@ def parse_args(argv):
     parser.add_argument("--seed", type=float, default=100)
     parser.add_argument("--clip_max_norm", default=1.0, type=float)
     parser.add_argument("--checkpoint", type=str, help="Path to checkpoint")
-    parser.add_argument("--type", type=str, default="mse", choices=["mse", "ms-ssim", "charbonnier"])
+    parser.add_argument("--type", type=str, default="charbonnier", choices=["mse", "ms-ssim", "charbonnier"])
     parser.add_argument("--save_path", type=str, required=True)
     parser.add_argument("--lr_epoch", nargs="+", type=int, default=[80, 90])
     parser.add_argument("--continue_train", action="store_true", default=False)

@@ -1,8 +1,6 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import math
-import time
 
 from compressai.models import CompressionModel
 from compressai.entropy_models import EntropyBottleneck, GaussianConditional
@@ -411,12 +409,7 @@ class DCAE(CompressionModel):
 
             # Try to retrieve logits from the module if stored during forward
             # This requires 'SpectralMoEDictionaryCrossAttention' to store 'self.last_routing_logits'
-            if hasattr(self.dt_cross_attention[i], "last_routing_logits"):
-                all_logits.append(self.dt_cross_attention[i].last_routing_logits)
-            elif hasattr(self.dt_cross_attention[i], "last_routing_weights"):
-                # If only weights (probs) are available, we can append those,
-                # but logits are preferred for numerical stability in loss
-                all_logits.append(self.dt_cross_attention[i].last_routing_weights)
+            all_logits.append((self.dt_cross_attention[i].last_routing_logits, self.dt_cross_attention[i].last_routing_indices))
 
             # B. Construct Support for Context: [MoE_Out + Query]
             support = torch.cat([dict_info, query], dim=1)
