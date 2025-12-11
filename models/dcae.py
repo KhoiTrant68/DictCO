@@ -1,17 +1,17 @@
-import torch
-import torch.nn as nn
 import math
 
-from compressai.models import CompressionModel
-from compressai.entropy_models import EntropyBottleneck, GaussianConditional
+import torch
+import torch.nn as nn
 from compressai.ans import BufferedRansEncoder, RansDecoder
+from compressai.entropy_models import EntropyBottleneck, GaussianConditional
+from compressai.models import CompressionModel
 from compressai.models.utils import update_registered_buffers
 
 # Assumes your original modules are present in the path
 from modules.new_swin_module import (
     ResScaleConvGateBlock,
-    SwinBlockWithConvMulti,
     SpectralMoEDictionaryCrossAttention,
+    SwinBlockWithConvMulti,
 )
 from modules.resnet_module import (
     ResidualBottleneckBlockWithStride,
@@ -409,7 +409,12 @@ class DCAE(CompressionModel):
 
             # Try to retrieve logits from the module if stored during forward
             # This requires 'SpectralMoEDictionaryCrossAttention' to store 'self.last_routing_logits'
-            all_logits.append((self.dt_cross_attention[i].last_routing_logits, self.dt_cross_attention[i].last_routing_indices))
+            all_logits.append(
+                (
+                    self.dt_cross_attention[i].last_routing_logits,
+                    self.dt_cross_attention[i].last_routing_indices,
+                )
+            )
 
             # B. Construct Support for Context: [MoE_Out + Query]
             support = torch.cat([dict_info, query], dim=1)

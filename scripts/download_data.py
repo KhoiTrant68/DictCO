@@ -1,9 +1,10 @@
-import warnings
-import yaml
-import fiftyone as fo
-import fiftyone.zoo as foz
 import os
 import shutil
+import warnings
+
+import fiftyone as fo
+import fiftyone.zoo as foz
+import yaml
 
 with open("scripts/openimage.yaml", "r") as f:
     data = yaml.safe_load(f)
@@ -28,7 +29,7 @@ for split, amount in map_amount.items():
         split=split,
         max_samples=amount,
         shuffle=True,
-        label_types=[],  
+        label_types=[],
     )
 
     fo_split_dir = os.path.join(data["path"], name, split, "data")

@@ -1,6 +1,5 @@
-from torch import nn
-from torch import Tensor
 from compressai.layers import conv3x3
+from torch import Tensor, nn
 
 
 class ResidualBottleneckBlock(nn.Module):

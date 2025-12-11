@@ -1,14 +1,18 @@
 import torch
 from thop import profile
+
 from models.dcae import DCAE
+
 
 # Wrapper to handle dict output
 class Wrapper(torch.nn.Module):
     def __init__(self, model):
         super().__init__()
         self.model = model
+
     def forward(self, x):
         return self.model(x)["x_hat"]
+
 
 # Layer-by-layer FLOPs counting hook
 def flops_counter(module, input, output):
@@ -28,12 +32,14 @@ def flops_counter(module, input, output):
         return
     module.__flops__ = getattr(module, "__flops__", 0) + flops
 
+
 # Attach hooks
 def attach_hooks(model):
     handles = []
     for name, module in model.named_modules():
         handles.append(module.register_forward_hook(flops_counter))
     return handles
+
 
 # Print top FLOPs layers
 def print_top_flops(model, top_k=10):
@@ -42,15 +48,16 @@ def print_top_flops(model, top_k=10):
         if hasattr(module, "__flops__"):
             flops_list.append((name, module.__class__.__name__, module.__flops__))
     flops_list.sort(key=lambda x: x[2], reverse=True)
-    
+
     print("\n--- Top FLOPs Layers ---")
     print(f"{'Layer Name':<40} {'Type':<20} {'FLOPs (M)':>12}")
-    print("-"*75)
+    print("-" * 75)
     for name, typ, flops in flops_list[:top_k]:
         print(f"{name:<40} {typ:<20} {flops/1e6:>12.3f}")
-    print("-"*75)
-    total_flops = sum([f for _,_,f in flops_list])
+    print("-" * 75)
+    total_flops = sum([f for _, _, f in flops_list])
     print(f"{'Total FLOPs (approx)':<62} {total_flops/1e9:>12.3f} G")
+
 
 # ==============================
 # Run the analysis

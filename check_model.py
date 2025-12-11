@@ -1,6 +1,8 @@
-import torch
 import time
+
+import torch
 from thop import profile
+
 from models.dcae import DCAE
 
 
@@ -17,6 +19,7 @@ def apply_layernorm_hook(model):
         if isinstance(m, torch.nn.LayerNorm):
             try:
                 from thop.vision.basic_hooks import register_hooks
+
                 register_hooks["LayerNorm"] = layernorm_hook
             except:
                 # Fallback: manually register hook (safe)
@@ -30,6 +33,7 @@ class Wrapper(torch.nn.Module):
     def __init__(self, model):
         super().__init__()
         self.model = model
+
     def forward(self, x):
         return self.model(x)["x_hat"]
 
@@ -53,7 +57,9 @@ def test_dcae_model():
     print(f"Input shape: {input_tensor.shape}")
     out = wrapped_model(input_tensor)
     print(f"Output shape: {out.shape}")
-    print("✅ Shapes match!" if out.shape == input_tensor.shape else "❌ Shape Mismatch!")
+    print(
+        "✅ Shapes match!" if out.shape == input_tensor.shape else "❌ Shape Mismatch!"
+    )
 
     # --- 2. Parameters Count ---
     print("\n--- 2. Parameters Count ---")
@@ -68,6 +74,7 @@ def test_dcae_model():
     print(f"GFLOPs (approx): {gflops:.2f} G")
     print("Note: Calculated on 256x256 resolution.")
     print("-----------------------------------------")
+
 
 if __name__ == "__main__":
     test_dcae_model()

@@ -1,6 +1,8 @@
-import torch
 import time
+
+import torch
 from flops_profiler.profiler import get_model_profile
+
 from models.dcae import DCAE
 
 
