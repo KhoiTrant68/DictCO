@@ -376,7 +376,7 @@ def main(argv):
     )
 
     global_step = 0
-    
+    dist.init_process_group(backend="nccl")
     for epoch in range(start_epoch, args.epochs):
         if accelerator.is_main_process:
             logger.info(f"Epoch {epoch} | LR: {optimizer.param_groups[0]['lr']}")
@@ -410,6 +410,6 @@ def main(argv):
     
     if accelerator.is_main_process:
         writer.close()
-
+    dist.destroy_process_group()
 if __name__ == "__main__":
     main(sys.argv[1:])
