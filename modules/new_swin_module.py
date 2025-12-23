@@ -448,47 +448,49 @@ class SpectralMoEDictionaryCrossAttention(nn.Module):
         return out.permute(0, 3, 1, 2)
 
     def process_high_freq_guided(self, hf, lf):
-        # hf, lf: NHWC
-        B, H, W, C_high = hf.shape
+            # hf, lf: NHWC
+            B, H, W, C_high = hf.shape
 
-        # 1. Routing
-        routing_logits = self.router(torch.cat([hf, lf], dim=-1))
-        self.last_routing_logits = routing_logits
+            # 1. Calculate RAW (Unbiased) Routing Logits
+            routing_logits = self.router(torch.cat([hf, lf], dim=-1))
+            self.last_routing_logits = routing_logits
 
-        # 2. Bias & Top-K (CRITICAL OPTIMIZATION: Calc once)
-        biased_logits = routing_logits + self.expert_biases.view(1, 1, 1, -1)
+            # 2. Add Bias ONLY for Selection (Top-K)
+            biased_logits = routing_logits + self.expert_biases.view(1, 1, 1, -1)
+            _, topk_indices = torch.topk(biased_logits, k=2, dim=-1)
+            
+            # Save indices for the balancer to use
+            self.last_routing_indices = topk_indices
 
-        # We save indices for the balancer to use later
-        _, topk_indices = torch.topk(biased_logits, k=2, dim=-1)
-        self.last_routing_indices = topk_indices
+            # 3. Calculate UNBIASED Weights for the final sum
+            # We calculate softmax on the raw logits
+            unbiased_probs = F.softmax(routing_logits, dim=-1) # [B, H, W, Experts]
 
-        # Softmax on biased logits
-        routing_weights = F.softmax(biased_logits, dim=-1)  # [B, H, W, Experts]
+            # 4. Create a mask to only keep the Top-K selected experts
+            # This ensures we only use the experts chosen by the biased selection
+            mask = torch.zeros_like(unbiased_probs).scatter_(-1, topk_indices, 1.0)
+            
+            # Apply mask and RE-NORMALIZE so the selected k-experts sum to 1.0
+            # This matches the reference code: top_k_probs = top_k_probs / top_k_probs.sum()
+            masked_probs = unbiased_probs * mask
+            routing_weights = masked_probs / (masked_probs.sum(dim=-1, keepdim=True) + 1e-8)
 
-        # 3. Expert Attention
-        # Flatten spatial for batched matmul: [B*H*W, C]
-        q = self.q_high(self.ln_high(hf)).reshape(-1, C_high)
+            # 5. Expert Attention (Computational part remains the same)
+            q = self.q_high(self.ln_high(hf)).reshape(-1, C_high)
+            all_keys = self.k_high(self.ln_dict_high(self.experts_high)) 
 
-        all_keys = self.k_high(
-            self.ln_dict_high(self.experts_high)
-        )  # [Total_Entries, C]
+            sim = torch.matmul(q, all_keys.transpose(0, 1)) * (C_high**-0.5)
+            sim = sim.view(B, H * W, self.num_experts, -1)
+            attn = F.softmax(sim, dim=-1) 
 
-        # Optimized Similarity: [N, C] @ [M, C]^T -> [N, M]
-        # Then reshape to [B, H*W, Experts, Entries_Per_Expert]
-        sim = torch.matmul(q, all_keys.transpose(0, 1)) * (C_high**-0.5)
-        sim = sim.view(B, H * W, self.num_experts, -1)
-        attn = F.softmax(sim, dim=-1)  # Softmax over entries within expert
+            v_experts = self.v_all(self.experts_high).view(self.num_experts, -1, C_high)
+            expert_outputs = torch.einsum("bhke,kec->bhkc", attn, v_experts)
 
-        v_experts = self.v_all(self.experts_high).view(self.num_experts, -1, C_high)
+            # 6. Final Weighted Sum using the Unbiased but Masked weights
+            router_weights_flat = routing_weights.view(B, H * W, self.num_experts, 1)
+            final_out = (expert_outputs * router_weights_flat).sum(dim=2)
 
-        # [B, HW, Exp, Ent] * [Exp, Ent, C] -> [B, HW, Exp, C]
-        expert_outputs = torch.einsum("bhke,kec->bhkc", attn, v_experts)
-
-        # Weighted sum by router: [B, HW, Exp, C] * [B, HW, Exp, 1] -> Sum over Exp
-        router_weights_flat = routing_weights.view(B, H * W, self.num_experts, 1)
-        final_out = (expert_outputs * router_weights_flat).sum(dim=2)
-
-        return final_out.view(B, H, W, C_high)
+            return final_out.view(B, H, W, C_high)
 
     def forward(self, x):
         shortcut = x
