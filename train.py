@@ -344,11 +344,6 @@ def parse_args(argv):
     parser.add_argument("--lr_epoch", nargs="+", type=int, default=[80, 90])
     parser.add_argument("--continue_train", action="store_true", default=False)
 
-    # Loss-Free Balancing Params
-    parser.add_argument(
-        "--update-rate", type=float, default=0.001, help="Update rate for expert biases"
-    )
-
     return parser.parse_args(argv)
 
 
@@ -428,7 +423,6 @@ def main(argv):
     criterion = RateDistortionLoss(
         lmbda=args.lmbda,
         loss_type=args.type,
-        alpha_moe=1.0,
         use_loss_free_balancing=True,
     )
 
