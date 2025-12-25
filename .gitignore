@@ -216,3 +216,5 @@ output_models/
 *.0
 *.out
 *.DS_store
+
+output/
