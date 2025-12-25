@@ -5,7 +5,7 @@ from einops import rearrange
 from timm.layers import DropPath, trunc_normal_
 
 # ==========================================
-# PART 1: OPTIMIZED BLOCKS (Flash Attention)
+# PART 1: OPTIMIZED BLOCKS 
 # ==========================================
 
 
