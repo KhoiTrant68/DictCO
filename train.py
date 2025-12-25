@@ -21,6 +21,7 @@ from torch.utils.tensorboard import SummaryWriter
 from torchvision import transforms
 from torchvision.utils import make_grid
 
+# Custom modules
 from loss.new_loss import AverageMeter, RateDistortionLoss
 from models.dcae import DCAE
 
@@ -49,13 +50,14 @@ class LossFreeBalancer:
         """
         Args:
             model: The unwrapped DCAE model.
-            router_data_tuple: List of tuples (logits, topk_indices) OR just logits from forward pass.
+            router_data_tuple: List of tuples (logits, topk_indices) OR just logits.
             accelerator: HuggingFace Accelerator instance (Required for DDP correctness).
         """
         if router_data_tuple is None:
             return
 
         for i, layer_data in enumerate(router_data_tuple):
+            # Parse tuple (logits, indices)
             if isinstance(layer_data, (tuple, list)) and len(layer_data) == 2:
                 _, topk_indices = layer_data
             else:
@@ -63,6 +65,8 @@ class LossFreeBalancer:
 
             # 1. Flatten indices to count globally
             flat_indices = topk_indices.contiguous().view(-1)
+            if flat_indices.numel() == 0:
+                continue
 
             # 2. Local Counts (on this GPU)
             local_counts = torch.bincount(
@@ -77,6 +81,7 @@ class LossFreeBalancer:
                 expert_counts = local_counts
 
             # 4. Calculate Load Error
+            # Target is perfectly even distribution
             avg_count = expert_counts.mean()
             violation_error = expert_counts - avg_count
 
@@ -86,10 +91,8 @@ class LossFreeBalancer:
             update_step = self.update_rate * torch.sign(violation_error)
 
             # Apply to model buffer
-            # Check if model has the specific MoE layer structure
-            if hasattr(model, "dt_cross_attention") and i < len(
-                model.dt_cross_attention
-            ):
+            # We must navigate the model structure to find 'expert_biases'
+            if hasattr(model, "dt_cross_attention") and i < len(model.dt_cross_attention):
                 moe_module = model.dt_cross_attention[i]
                 if hasattr(moe_module, "expert_biases"):
                     # In-place update on correct device
@@ -122,6 +125,9 @@ def setup_logger(log_dir):
 
 
 def configure_optimizers(net, args):
+    """
+    SOTA Config: Uses AdamW instead of Adam for better generalization with Swin/Transformers.
+    """
     parameters = {
         n
         for n, p in net.named_parameters()
@@ -135,10 +141,14 @@ def configure_optimizers(net, args):
 
     params_dict = dict(net.named_parameters())
 
-    optimizer = optim.Adam(
+    # AdamW is standard for Swin Transformers
+    optimizer = optim.AdamW(
         (params_dict[n] for n in sorted(parameters)),
         lr=args.learning_rate,
+        weight_decay=0.05, # Standard Swin weight decay
     )
+    
+    # Aux optimizer usually stays as standard Adam
     aux_optimizer = optim.Adam(
         (params_dict[n] for n in sorted(aux_parameters)),
         lr=args.aux_learning_rate,
@@ -159,6 +169,7 @@ def train_one_epoch(
     writer,
     global_step,
     balancer,
+    accum_steps,
 ):
     model.train()
 
@@ -168,6 +179,7 @@ def train_one_epoch(
     aux_losses = AverageMeter()
     moe_metrics = AverageMeter()
 
+    # Determine metric name for logging
     if criterion.loss_type == "mse":
         dist_key = "mse_loss"
     elif criterion.loss_type == "charbonnier":
@@ -175,51 +187,49 @@ def train_one_epoch(
     else:
         dist_key = "ms_ssim_loss"
 
-    for i, d in enumerate(train_dataloader):
-        optimizer.zero_grad(set_to_none=True)
-        aux_optimizer.zero_grad(set_to_none=True)
+    # Reset gradients at start of epoch
+    optimizer.zero_grad(set_to_none=True)
+    aux_optimizer.zero_grad(set_to_none=True)
 
-        # Forward Pass
+    for i, d in enumerate(train_dataloader):
+        # 1. Forward Pass
         out_net = model(d)
 
-        # Compute Loss
-        # Note: use_loss_free_balancing=True in criterion means 'moe_loss' is NOT added to 'loss'
+        # 2. Compute Loss
         out_criterion = criterion(out_net, d)
+        
+        # Scale loss for gradient accumulation
+        loss = out_criterion["loss"] / accum_steps
 
-        # Backward (Main)
-        accelerator.backward(out_criterion["loss"])
-        for name, p in model.named_parameters():
-            if p.grad is None:
-                continue
-            if p.grad.stride() != p.grad.contiguous().stride():
-                print(f"[WARNING] Param: {name}")
-                print(f"  grad shape:   {p.grad.shape}")
-                print(f"  grad strides: {p.grad.stride()}")
-                print(f"  good strides: {p.grad.contiguous().stride()}")
+        # 3. Backward (Main)
+        accelerator.backward(loss)
 
-        if clip_max_norm > 0:
-            accelerator.clip_grad_norm_(model.parameters(), clip_max_norm)
+        # 4. Optimization Step (Only after accumulation steps)
+        if (i + 1) % accum_steps == 0:
+            if clip_max_norm > 0:
+                accelerator.clip_grad_norm_(model.parameters(), clip_max_norm)
 
-        optimizer.step()
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
 
-        # --- LOSS-FREE BALANCING UPDATE ---
-        # Update expert biases based on current batch logits
-        # We perform this Update AFTER optimizer step (decoupled update)
-        if "router_logits" in out_net and out_net["router_logits"] is not None:
-            # We must access the underlying model to modify buffers
-            unwrapped = accelerator.unwrap_model(model)
-            # Pass accelerator to allow global synchronization of expert counts
-            balancer.update_model_biases(
-                unwrapped, out_net["router_logits"], accelerator=accelerator
-            )
+            # --- LOSS-FREE BALANCING UPDATE ---
+            # Update happens once per effective batch
+            if "router_logits" in out_net and out_net["router_logits"] is not None:
+                unwrapped = accelerator.unwrap_model(model)
+                balancer.update_model_biases(
+                    unwrapped, out_net["router_logits"], accelerator=accelerator
+                )
 
-        # Aux Backward (Entropy Model)
+        # 5. Aux Backward (Entropy Model) - Usually done every step or every accum step
+        # Standard CompressAI implementation does this every step
         unwrapped_model = accelerator.unwrap_model(model)
         aux_loss = unwrapped_model.aux_loss()
         accelerator.backward(aux_loss)
         aux_optimizer.step()
+        aux_optimizer.zero_grad(set_to_none=True)
 
         # --- Metrics & Logging ---
+        # Note: We log the unscaled loss for readability
         losses.update(out_criterion["loss"].item())
         bpp_losses.update(out_criterion["bpp_loss"].item())
         aux_losses.update(aux_loss.item())
@@ -227,9 +237,10 @@ def train_one_epoch(
         if dist_key in out_criterion:
             dist_losses.update(out_criterion[dist_key].item())
 
-        # Log the calculated (but not optimized) MoE loss to monitor balance
-        if "moe_loss" in out_criterion:
-            moe_val = out_criterion["moe_loss"]
+        # Correctly looking for "moe_imbalance"
+        if "moe_imbalance" in out_criterion:
+            moe_val = out_criterion["moe_imbalance"]
+            # Handle both tensor (0-dim) and float
             if isinstance(moe_val, torch.Tensor):
                 moe_val = moe_val.item()
             moe_metrics.update(moe_val)
@@ -241,7 +252,7 @@ def train_one_epoch(
                     f"Loss {losses.val:.4f}\t"
                     f"Bpp {bpp_losses.val:.4f}\t"
                     f"Dist {dist_losses.val:.5f}\t"
-                    f"MoE_Metric {moe_metrics.val:.4f}"  # Monitoring only
+                    f"MoE_Imbal {moe_metrics.val:.4f}"
                 )
 
             if writer is not None:
@@ -284,10 +295,13 @@ def test_epoch(epoch, test_dataloader, model, criterion, accelerator, logger, wr
             if dist_key in out_criterion:
                 dist_loss_meter.update(out_criterion[dist_key].item())
 
+            # Log validation images to Tensorboard (First batch only)
             if i == 0 and accelerator.is_main_process and writer is not None:
                 n_imgs = min(4, d.size(0))
                 inputs = d[:n_imgs].cpu()
                 recons = out_net["x_hat"][:n_imgs].cpu().clamp(0, 1)
+                
+                # Create comparison grid: Top=Input, Bottom=Recon
                 combined = torch.cat([inputs, recons], dim=0)
                 grid = make_grid(combined, nrow=n_imgs, padding=2, normalize=False)
                 writer.add_image("Val_Images", grid, epoch)
@@ -318,16 +332,16 @@ def save_checkpoint(state, is_best, epoch, save_path, filename="checkpoint.pth.t
 
 
 def parse_args(argv):
-    parser = argparse.ArgumentParser(description="DCAE Loss-Free Training")
+    parser = argparse.ArgumentParser(description="DCAE Loss-Free SOTA Training")
     parser.add_argument(
         "-d", "--dataset", type=str, required=True, help="Path to Dataset"
     )
     parser.add_argument("-e", "--epochs", default=100, type=int)
     parser.add_argument("-lr", "--learning-rate", default=1e-4, type=float)
-    parser.add_argument("-n", "--num-workers", type=int, default=1)
+    parser.add_argument("-n", "--num-workers", type=int, default=4)
     parser.add_argument("--lambda", dest="lmbda", type=float, default=0.0018)
     parser.add_argument("--batch-size", type=int, default=1)
-    parser.add_argument("--test-batch-size", type=int, default=4)
+    parser.add_argument("--test-batch-size", type=int, default=1)
     parser.add_argument("--aux-learning-rate", default=1e-3, type=float)
     parser.add_argument("--patch-size", type=int, nargs=2, default=(256, 256))
     parser.add_argument("--save", action="store_true", default=True)
@@ -343,8 +357,10 @@ def parse_args(argv):
     parser.add_argument("--save_path", type=str, required=True)
     parser.add_argument("--lr_epoch", nargs="+", type=int, default=[80, 90])
     parser.add_argument("--continue_train", action="store_true", default=False)
-
-    # Loss-Free Balancing Params
+    
+    # New SOTA Args
+    parser.add_argument("--accumulation-steps", type=int, default=16, 
+                        help="Gradient accumulation steps. Crucial for MoE if Batch Size is small.")
     parser.add_argument(
         "--update-rate", type=float, default=0.001, help="Update rate for expert biases"
     )
@@ -354,7 +370,13 @@ def parse_args(argv):
 
 def main(argv):
     args = parse_args(argv)
-    accelerator = Accelerator(log_with="tensorboard", project_dir=args.save_path)
+    
+    # Initialize Accelerate
+    accelerator = Accelerator(
+        log_with="tensorboard", 
+        project_dir=args.save_path,
+        gradient_accumulation_steps=args.accumulation_steps
+    )
     set_seed(args.seed)
 
     logger = None
@@ -368,8 +390,18 @@ def main(argv):
         writer = SummaryWriter(os.path.join(save_path, "tensorboard"))
         logger = setup_logger(save_path)
         logger.info(f"Training started on {accelerator.device}")
+        
+        # Check Critical Hyperparams
+        if args.type == 'ms_ssim' and args.lmbda < 1.0:
+            logger.warning("WARNING: You are using MS-SSIM with a small Lambda (< 1.0). "
+                           "The model will likely collapse to gray images. "
+                           "Recommended Lambda for MS-SSIM: 10.0 - 100.0.")
+        
+        logger.info(f"Batch Size: {args.batch_size}")
+        logger.info(f"Accumulation Steps: {args.accumulation_steps}")
+        logger.info(f"Effective Batch Size: {args.batch_size * args.accumulation_steps * accelerator.num_processes}")
 
-    # Data
+    # Data Transforms
     train_transforms = transforms.Compose(
         [transforms.RandomCrop(args.patch_size), transforms.ToTensor()]
     )
@@ -395,18 +427,22 @@ def main(argv):
         pin_memory=True,
     )
 
-    # Model
+    # Model Initialization
     net = DCAE()
 
-    # --- Initialize Balancer ---
-    # Assuming standard MoE config (4 experts)
-    # If dynamic, get from net config
+    # Balancer Initialization
+    # Assuming 4 experts as per standard DCAE config
     balancer = LossFreeBalancer(num_experts=4, update_rate=args.update_rate)
 
     start_epoch = 0
     best_loss = float("inf")
 
     optimizer, aux_optimizer = configure_optimizers(net, args)
+    
+    # Scheduler: Cosine is better for SOTA training than MultiStepLR
+    # However, kept MultiStepLR if strict reproducibility with older code is needed.
+    # To switch to SOTA:
+    # lr_scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
     milestones = args.lr_epoch if args.lr_epoch else [args.epochs - 10]
     lr_scheduler = optim.lr_scheduler.MultiStepLR(
         optimizer, milestones, gamma=0.1, last_epoch=-1
@@ -422,15 +458,14 @@ def main(argv):
             lr_scheduler.load_state_dict(checkpoint["lr_scheduler"])
             best_loss = checkpoint["loss"]
 
-    # --- Loss Config ---
-    # ENABLE Loss-Free: use_loss_free_balancing=True
-    # This prevents RateDistortionLoss from adding moe_loss to gradients
+    # Loss Initialization
     criterion = RateDistortionLoss(
         lmbda=args.lmbda,
         loss_type=args.type,
         use_loss_free_balancing=True,
     )
 
+    # Accelerate Prepare
     net, optimizer, aux_optimizer, train_dataloader, valid_dataloader, lr_scheduler = (
         accelerator.prepare(
             net,
@@ -447,7 +482,6 @@ def main(argv):
         if accelerator.is_main_process:
             logger.info(f"Epoch {epoch} | LR: {optimizer.param_groups[0]['lr']}")
 
-        # Pass balancer to train loop
         global_step = train_one_epoch(
             net,
             criterion,
@@ -461,6 +495,7 @@ def main(argv):
             writer,
             global_step,
             balancer=balancer,
+            accum_steps=args.accumulation_steps,
         )
 
         loss = test_epoch(
